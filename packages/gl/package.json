@@ -34,7 +34,6 @@
     "@maptalks/function-type": "^1.4.1",
     "@maptalks/fusiongl": "workspace:*",
     "@maptalks/gltf-loader": "workspace:*",
-    "maptalks": "workspace:*",
     "@maptalks/martini": "^0.4.0",
     "@maptalks/regl": "^3.6.0",
     "@maptalks/tbn-packer": "^1.4.5",
@@ -44,12 +43,14 @@
     "earcut": "^3.0.1",
     "frustum-intersects": "^0.2.4",
     "gl-matrix": "^3.4.0",
+    "maptalks": "workspace:*",
     "wgsl_reflect": "^1.0.16"
   },
   "devDependencies": {
     "@maptalks/rollup-plugin-glsl-minify": "^0.1.7",
     "@rollup/plugin-commonjs": "^25.0.7",
     "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-replace": "^5.0.5",
     "@rollup/plugin-terser": "0.4.4",
     "@rollup/plugin-typescript": "^11.1.6",
     "eslint": "^8.57.0",
