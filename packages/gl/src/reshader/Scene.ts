@@ -11,6 +11,11 @@ let uid = 0;
 let _distCache: Float64Array = new Float64Array(256);
 let _distCacheSize = 256;
 
+// 复用的排序索引 / 结果暂存数组，避免每帧为排序分配新数组（仅按需扩容）。
+// Reused index / scratch arrays for the index-based sort, avoiding per-frame allocations (grown on demand only).
+const _sortIndices: number[] = [];
+const _sortScratch: Mesh[] = [];
+
 // 动态扩容距离缓存数组，保证 _sortTransparentsByDistance 写操作不越界。
 // Dynamically expands the distance buffer so _sortTransparentsByDistance never writes out-of-bounds.
 function ensureDistCacheSize(size: number) {
@@ -195,8 +200,12 @@ class Scene {
         this._dirty = false;
     }
 
-    // 预计算距离并按距相机远近排序透明mesh（远→近），原地插入排序以获得稳定的渲染顺序。
-    // Pre-compute per-mesh distances and insertion-sort transparents back-to-front (far → near) in-place.
+    // 预计算距离并按距相机远近排序透明mesh（远→近）。
+    // Pre-compute per-mesh distances and sort transparents back-to-front (far → near).
+    // 使用索引数组 + 原生 Array.sort：复杂度 O(n log n)，避免对大 n（三维管网/建筑等
+    // 大量透明mesh）做 O(n²) 插入排序导致拖动/旋转时单帧耗时暴涨。
+    // Uses an index array plus native Array.sort — O(n log n) instead of O(n²) insertion sort,
+    // which matters when many transparent meshes are present (3D pipes / buildings).
     _sortTransparentsByDistance(transparents: Mesh[], cameraPosition: vec3) {
         const len = transparents.length;
         // 确保距离缓存足够容纳当前所有透明 mesh。
@@ -212,19 +221,25 @@ class Scene {
             _distCache[i] = vec3.sqrDist(TEMP_CENTER, cameraPosition);
         }
 
-        // 原地排序，按距离降序（远处先渲染）保证半透明混合正确顺序
-        // Pass 2: in-place insertion sort by descending squared distance (farther meshes drawn first for correct transparency blending).
-        for (let i = 1; i < len; i++) {
-            const curMesh = transparents[i];
-            const curDist = _distCache[i];
-            let j = i - 1;
-            while (j >= 0 && _distCache[j] < curDist) {
-                transparents[j + 1] = transparents[j];
-                _distCache[j + 1] = _distCache[j];
-                j--;
-            }
-            transparents[j + 1] = curMesh;
-            _distCache[j + 1] = curDist;
+        // Pass 2: 对索引按距离降序排序（远处先渲染），避免在大数组上做 O(n²) 原地插入排序。
+        // Index array sorted by descending distance via native sort (O(n log n)); index tiebreak keeps it deterministic.
+        _sortIndices.length = len;
+        for (let i = 0; i < len; i++) {
+            _sortIndices[i] = i;
+        }
+        _sortIndices.sort((a, b) => {
+            const diff = _distCache[b] - _distCache[a];
+            return diff !== 0 ? diff : a - b;
+        });
+
+        // Pass 3: 按排序后的索引重排 transparents（借用暂存数组，原地写回）。
+        // Reorder transparents according to the sorted indices via a reused scratch array.
+        _sortScratch.length = len;
+        for (let i = 0; i < len; i++) {
+            _sortScratch[i] = transparents[_sortIndices[i]];
+        }
+        for (let i = 0; i < len; i++) {
+            transparents[i] = _sortScratch[i];
         }
     }
 

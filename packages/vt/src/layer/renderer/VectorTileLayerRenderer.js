@@ -21,6 +21,11 @@ const MAX_PENDING_PARSE = 128;
 // 相比数量配额，时间配额直接限制大瓦片/多瓦片集中回传时单帧 CPU 峰值，
 // 把解析工作摊平到后续帧，避免 rAF/事件处理超时掉帧。
 const DEFAULT_PARSE_TIME_BUDGET_PER_FRAME = 8;
+// 单个 url 的 per-tile 分片超时保护（ms）：正常情况下 _processTileBatch 每次调用
+// 至少处理一个 tile，分片必然收敛；该阈值仅作为最后兜底，避免因异常导致分片
+// 永久无法完成——此时 partial.parsing 恒为 true，暂存的点要素永不合并，
+// 且 _processTileBatch 反复 setToRedraw 使渲染循环无法收敛。
+const PARSING_TILE_TIMEOUT_MS = 10000;
 const EMPTY_ARRAY = [];
 const CLEAR_COLOR = [0, 0, 0, 0];
 const TILE_POINT = new maptalks.Point(0, 0);
@@ -804,14 +809,17 @@ class VectorTileLayerRenderer extends CanvasCompatible(TileLayerRendererable(Lay
     }
 
     _onReceiveMVTData(url, err, data) {
-        this.setToRedraw();
         if (data && data.pointOnly) {
             // 按要素类型拆分回传的第二阶段：仅点要素 slot。
             // 第一阶段（partial）的 _requestingMVT[url] 已被删除，这里直接走合并：
             // 若 partial 已解析则立即合并，否则暂存 _pendingPointData 待 partial 解析后合并。
             this._mergePointData(url, data);
+            this.setToRedraw();
             return;
         }
+        // 被丢弃/无效的回传不再触发重绘：加载高峰期大量过期（取消/样式已切换/无对应
+        // 加载批次）的回传若每次都请求重绘，会把渲染循环持续维持在"每帧重绘"状态，
+        // 叠加其他图层的每帧开销后放大掉帧。
         if (!this._requestingMVT[url]) {
             return;
         }
@@ -822,6 +830,7 @@ class VectorTileLayerRenderer extends CanvasCompatible(TileLayerRendererable(Lay
             //返回的是上一个style的tileData
             return;
         }
+        this.setToRedraw();
         if (this._parseBudget <= 0) {
             // 本帧解析配额已用完：先把数据挂入待解析队列，由 _drainParseQueue 在后续帧
             // 按每帧配额解析，把主线程 CPU 峰值摊平到多帧（多 Worker 并行解码时回传集中，
@@ -889,6 +898,11 @@ class VectorTileLayerRenderer extends CanvasCompatible(TileLayerRendererable(Lay
         // 时间配额把 per-tile 工作切到后续帧，保证单帧 CPU 峰值有界。
         const timeStart = performance.now();
         const timeBudget = this._getParseTimeBudget();
+        // 超时兜底：单个 url 的分片长时间未完成时强制收尾，避免永久阻塞与渲染循环无法收敛。
+        if (this._parsingTile && this._parsingTile.startTime &&
+            timeStart - this._parsingTile.startTime > PARSING_TILE_TIMEOUT_MS) {
+            this._finalizeTimedOutParsingTile();
+        }
         // 优先恢复上一帧未完成的 per-tile 分片（repeatWorld 多瓦片场景）
         if (this._parsingTile) {
             this._processTileBatch(timeStart, timeBudget);
@@ -1040,9 +1054,31 @@ class VectorTileLayerRenderer extends CanvasCompatible(TileLayerRendererable(Lay
             data,
             tiles,
             parsedFeatures: features,
-            tileIndex: 0
+            tileIndex: 0,
+            // 记录分片开始时间，供 _drainParseQueue 的超时兜底判断
+            startTime: performance.now()
         };
         this._processTileBatch(timeStart, timeBudget);
+    }
+
+    // 超时兜底：强制结束长时间未完成的分片，解除 partial.parsing 并合并暂存的点要素，
+    // 避免永久阻塞（正常路径下 _processTileBatch 的收敛保证不会走到这里）。
+    _finalizeTimedOutParsingTile() {
+        const entry = this._parsingTile;
+        if (!entry) {
+            return;
+        }
+        const { url } = entry;
+        this._parsingTile = null;
+        const partial = this._partialTileData[url];
+        if (partial) {
+            partial.parsing = false;
+        }
+        const pendingPoint = this._pendingPointData[url];
+        if (pendingPoint) {
+            delete this._pendingPointData[url];
+            this._mergePointData(url, pendingPoint);
+        }
     }
 
     _processTileBatch(timeStart, timeBudget) {
@@ -1053,8 +1089,12 @@ class VectorTileLayerRenderer extends CanvasCompatible(TileLayerRendererable(Lay
         const { url, data, tiles, parsedFeatures } = entry;
         const layer = this.layer;
         const debugTileData = layer.options['debugTileData'];
+        // 收敛保证：每次调用至少处理一个 tile（即使进入时时间预算已被同帧内更早的
+        // 解析工作耗尽）。否则分片可能在"时间预算耗尽→setToRedraw→下帧预算又耗尽"
+        // 之间空转，使 partial.parsing 长期为 true、渲染循环无法收敛。
+        let processedInCall = 0;
         while (entry.tileIndex < tiles.length) {
-            if (timeBudget > 0 && performance.now() - timeStart >= timeBudget) {
+            if (processedInCall > 0 && timeBudget > 0 && performance.now() - timeStart >= timeBudget) {
                 // 本帧时间预算耗尽，保留 entry 状态（tileIndex 已推进），
                 // 下帧由 _drainParseQueue 继续处理
                 // 【修复】地图静止时渲染循环可能停止，若不主动唤醒下一帧，
@@ -1065,6 +1105,7 @@ class VectorTileLayerRenderer extends CanvasCompatible(TileLayerRendererable(Lay
                 return;
             }
             const i = entry.tileIndex++;
+            processedInCall++;
             const tileInfo = tiles[i];
             if (i === 0) {
                 if (debugTileData) {

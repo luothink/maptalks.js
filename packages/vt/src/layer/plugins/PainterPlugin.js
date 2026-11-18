@@ -12,6 +12,16 @@ const NO_REDRAW = {
 
 const EMPTY_ARRAY = [];
 
+// 跨帧复用 mesh 时，离开视口的瓦片原本只在"相机完全静止且无瓦片加载"的帧才清理；
+// 持续拖动/旋转/加载时该条件几乎永不成立，导致 scene 中的 mesh 无界增长，
+// 每帧排序/绘制/求交开销随 mesh 数持续上升，最终表现为掉帧乃至浏览器无响应。
+// 因此增加两道兜底：
+//  1) STALE_FRAME_LIMIT：连续若干帧未被绘制且不在视口内的 mesh 视为陈旧，可安全移除；
+//  2) MAX_RETAINED_TILE_MESHES：保留数量上限，超出时按最久未绘制优先移除。
+// 缩放过渡期间（isZooming）仍保留旧 zoom 背景瓦片，不执行以上清理以免画面闪空。
+const STALE_FRAME_LIMIT = 60;
+const MAX_RETAINED_TILE_MESHES = 256;
+
 let meshUID = 1;
 /**
  * Create a VT Plugin with a given painter
@@ -26,6 +36,8 @@ function createPainterPlugin(type, Painter) {
             // 缓存每个瓦片 key 对应的 stencil level 值，跨帧复用 mesh 场景下，
             // 当 level 未变化时跳过对每个 mesh 的属性写入操作，降低 CPU 开销。
             this._tileLevels = {};
+            // 递增的帧计数，用于记录每个 mesh 最近一次被绘制的帧，供陈旧清理判断。
+            this._frameIndex = 0;
         },
 
         isVisible() {
@@ -68,6 +80,7 @@ function createPainterPlugin(type, Painter) {
             const hasAnimation = !!sceneConfig.animation;
             const isTerrainVector = !!(painter.isTerrainVector && painter.isTerrainVector());
             this._hasAnimation = hasAnimation;
+            this._frameIndex = (this._frameIndex || 0) + 1;
             if (hasAnimation || isTerrainVector) {
                 //有入场动画或地形矢量时，维持每帧重建 mesh 的旧行为
                 painter.startFrame(context);
@@ -107,7 +120,11 @@ function createPainterPlugin(type, Painter) {
                 // 2. 相机已静止但瓦片仍在异步加载（tilesLoading 非空）：
                 //    此时旧 zoom 的背景 mesh 不再被 paintTile，但新瓦片尚未就绪，
                 //    一旦清理会把仍在屏幕上的背景瓦片移除，造成出图后消失/大面积空白。
-                // 因此仅当相机静止且当前无瓦片加载时才执行清理。
+                // 因此：
+                //  - 完全静止且无加载：全量清理（原有行为）；
+                //  - 交互(拖动/旋转)/加载中：执行有限清理（仅移除长期未绘制且不在视口内的
+                //    mesh，并限制保留数量上限），避免持续交互时 mesh 无界增长；
+                //  - 缩放过渡中：保留旧 zoom 背景瓦片，不清理以免画面闪空。
                 if (this._paintedKeys) {
                     const map = context.layer && context.layer.getMap && context.layer.getMap();
                     const isInteracting = !!(map && map.isInteracting && map.isInteracting());
@@ -115,8 +132,11 @@ function createPainterPlugin(type, Painter) {
                     const isZooming = !!(map && map.isZooming && map.isZooming());
                     const renderer = context.layer && context.layer.getRenderer && context.layer.getRenderer();
                     const tilesLoadingCount = renderer && renderer.tilesLoading ? Object.keys(renderer.tilesLoading).length : 0;
-                    if (!isInteracting && !isMoving && !isZooming && tilesLoadingCount === 0) {
-                        this._removeStaleTileMeshes(context);
+                    const isStill = !isInteracting && !isMoving && !isZooming && tilesLoadingCount === 0;
+                    if (isStill) {
+                        this._removeStaleTileMeshes(context, true);
+                    } else if (!isZooming) {
+                        this._removeStaleTileMeshes(context, false);
                     }
                     this._paintedKeys = null;
                 }
@@ -140,7 +160,11 @@ function createPainterPlugin(type, Painter) {
             }
         },
 
-        _removeStaleTileMeshes(context) {
+        // aggressive=true：全量清理本帧未绘制的 mesh（相机完全静止时使用，原有行为）。
+        // aggressive=false：有限清理，仅移除已连续多帧未绘制（STALE_FRAME_LIMIT）且不在
+        //   视口内的 mesh；若保留数量仍超过上限（MAX_RETAINED_TILE_MESHES），
+        //   再按最久未绘制优先继续移除，保证 scene 中的 mesh 规模有界。
+        _removeStaleTileMeshes(context, aggressive) {
             const frameCache = this._frameCache;
             const paintedKeys = this._paintedKeys;
             const meshCache = this._meshCache;
@@ -153,24 +177,58 @@ function createPainterPlugin(type, Painter) {
             // 否则会出现局部区域出图后消失。
             const renderer = context && context.layer && context.layer.getRenderer && context.layer.getRenderer();
             const tilesInView = renderer && renderer.tilesInView;
+            const currentFrame = this._frameIndex || 0;
+            const staleBefore = currentFrame - STALE_FRAME_LIMIT;
+
+            let total = 0;
+            const stale = [];
+            const pending = [];
             for (const key in frameCache) {
-                if (!paintedKeys[key]) {
-                    const meshes = meshCache[key];
-                    if (tilesInView && meshes && meshes.length) {
-                        const tile = meshes[0].properties && meshes[0].properties.tile;
-                        if (tile && tile.id && tilesInView[tile.id]) {
-                            // 瓦片仍在视口内，仅本帧未绘制（数据加载/过渡），保留背景 mesh
-                            continue;
-                        }
-                    }
-                    if (meshes && meshes.length) {
-                        this.painter.removeMeshFromScene(meshes);
-                    }
-                    delete frameCache[key];
-                    if (this._tileLevels) {
-                        delete this._tileLevels[key];
+                total++;
+                if (paintedKeys && paintedKeys[key]) {
+                    continue;
+                }
+                const meshes = meshCache[key];
+                if (tilesInView && meshes && meshes.length) {
+                    const tile = meshes[0].properties && meshes[0].properties.tile;
+                    if (tile && tile.id && tilesInView[tile.id]) {
+                        // 瓦片仍在视口内，仅本帧未绘制（数据加载/过渡），保留背景 mesh
+                        continue;
                     }
                 }
+                if (aggressive || frameCache[key] <= staleBefore) {
+                    stale.push(key);
+                } else {
+                    pending.push(key);
+                }
+            }
+
+            // 数量上限兜底：交互期间即使尚未达到陈旧阈值，也不允许保留量无界增长，
+            // 超出上限时按最久未绘制优先补充移除。
+            let toRemove = stale;
+            const excess = total - MAX_RETAINED_TILE_MESHES;
+            if (!aggressive && excess > 0 && stale.length < excess && pending.length) {
+                pending.sort((a, b) => frameCache[a] - frameCache[b]);
+                toRemove = stale.concat(pending.slice(0, excess - stale.length));
+            }
+            if (!toRemove.length) {
+                return;
+            }
+
+            const meshesToRemove = [];
+            for (let i = 0; i < toRemove.length; i++) {
+                const key = toRemove[i];
+                const meshes = meshCache[key];
+                if (meshes && meshes.length) {
+                    meshesToRemove.push(meshes);
+                }
+                delete frameCache[key];
+                if (this._tileLevels) {
+                    delete this._tileLevels[key];
+                }
+            }
+            for (let i = 0; i < meshesToRemove.length; i++) {
+                this.painter.removeMeshFromScene(meshesToRemove[i]);
             }
         },
 
@@ -378,7 +436,8 @@ function createPainterPlugin(type, Painter) {
                 }
 
                 painter.addMesh(meshes, progress, context);
-                this._frameCache[key] = 1;
+                // 记录最近一次绘制该 mesh 的帧号，供陈旧清理（_removeStaleTileMeshes）判断。
+                this._frameCache[key] = this._frameIndex || 0;
             }
 
             return {

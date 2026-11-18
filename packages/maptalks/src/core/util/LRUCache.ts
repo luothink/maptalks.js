@@ -9,8 +9,11 @@
  * 3. Aggressive disposal: onRemove callback receives entries that can then release
  *    image data (canvas/image bytes), GL textures, and mesh resources.
  * 4. Batch eviction: shrink() evicts multiple entries per call to reduce churn.
- * 5. iterator-safety: Map iteration is safe during delete; we collect keys first
- *    and then remove them.
+ * 5. O(1) LRU ordering: the Map's own insertion order is used as the LRU list
+ *    (evict = first key, "move to MRU" = delete + set). The previous parallel
+ *    `_usageOrder` array required indexOf()+splice() on every get/add/remove,
+ *    degrading those hot paths to O(n) — with a 50000-entry text-texture cache
+ *    that alone caused per-frame stalls.
  *
  * LRU 缓存，具备内存感知驱逐和真正的 LRU 语义。
  *
@@ -21,15 +24,19 @@
  * 3. 激进的资源释放：onRemove 回调接收条目后，可释放
  *    图像数据（canvas/图像字节）、GL 纹理和网格资源。
  * 4. 批量驱逐：shrink() 每次调用驱逐多个条目，以减少抖动。
- * 5. 迭代器安全：删除期间的 Map 迭代是安全的；先收集键再删除。
+ * 5. O(1) 的 LRU 顺序：直接复用 Map 自身的插入顺序作为 LRU 链
+ *    （驱逐 = 取第一个键，"移到 MRU" = delete 后 set）。此前的并行
+ *    `_usageOrder` 数组使每次 get/add/remove 都要 indexOf()+splice()，
+ *    退化为 O(n)——在 50000 条目的文字纹理缓存上会直接造成逐帧卡顿。
  */
 class LRUCache {
     max: number;
     maxMemory: number;
     onRemove: Function;
+    // Map 的插入顺序即 LRU 顺序：第一个键 = 最久未使用，最后一个键 = 最近使用。
+    // Map insertion order doubles as the LRU order: first key = LRU, last key = MRU.
     data: Map<any, any>;
     private _currentSize: number;
-    private _usageOrder: any[];
 
     constructor(max: number, onRemove?: Function) {
         const nullOnRemove = () => {};
@@ -50,7 +57,6 @@ class LRUCache {
         }
         this.data = new Map();
         this._currentSize = 0;
-        this._usageOrder = [];
         return this;
     }
 
@@ -111,14 +117,11 @@ class LRUCache {
         if (this.has(key)) {
             // Remove old entry (will be re-inserted as MRU)
             // 移除旧条目（随后会作为 MRU 重新插入）
-            const idx = this._usageOrder.indexOf(key);
-            if (idx !== -1) this._usageOrder.splice(idx, 1);
             this._currentSize -= this._dataSize(key);
             this.data.delete(key);
         }
 
         this.data.set(key, data);
-        this._usageOrder.push(key);
         this._currentSize += estimatedSize;
 
         // Eager eviction when we're over count or memory limits
@@ -131,7 +134,7 @@ class LRUCache {
         // 使单个 VT 瓦片加载造成的轻微超额不会触发完整的 shrink 周期。
         // 与 shrink() 中的 90% 目标配合，形成干净的 20% 区间，
         // 防止高 zoom 时的频繁抖动（thrashing）。
-        if (this._usageOrder.length > this.max ||
+        if (this.data.size > this.max ||
             this._currentSize > this.maxMemory * 1.1) {
             // During memory overflow, scale eviction batch proportional to
             // excess to converge faster — 2x budget → 2x batch, etc.
@@ -151,7 +154,28 @@ class LRUCache {
     }
 
     keys() {
-        return this._usageOrder.slice();
+        return Array.from(this.data.keys());
+    }
+
+    /**
+     * Evict the least-recently-used entry (the first key in Map insertion order).
+     * O(1) removal, replacing the previous indexOf()+splice() bookkeeping on a
+     * parallel usage-order array.
+     *
+     * 驱逐最久未使用的条目（Map 插入顺序中的第一个键）。
+     * 删除为 O(1)，替代此前在并行 usage-order 数组上 indexOf()+splice() 的开销。
+     */
+    private _evictOldest(): boolean {
+        const iterator = this.data.keys().next();
+        if (iterator.done) {
+            return false;
+        }
+        const key = iterator.value;
+        const data = this.data.get(key);
+        this._currentSize -= this._estimateSize(data);
+        this.data.delete(key);
+        this.onRemove(data);
+        return true;
     }
 
     /**
@@ -194,19 +218,11 @@ class LRUCache {
 
         // Evict from the front (least recently used) until within count limits
         // 从头部（最久未使用）开始驱逐，直至回到条目数限额内
-        while (this._usageOrder.length > this.max &&
-               this._usageOrder.length > 0 &&
-               evicted < maxEvictions) {
-            const key = this._usageOrder[0];
-            const removedData = this.getAndRemove(key);
-            if (removedData) {
-                this.onRemove(removedData);
-                evicted++;
-            } else {
-                // Clean up stale index entry
-                // 清理过期的索引条目
-                this._usageOrder.shift();
+        while (this.data.size > this.max && evicted < maxEvictions) {
+            if (!this._evictOldest()) {
+                break;
             }
+            evicted++;
         }
 
         // Also evict if over memory budget.
@@ -221,16 +237,11 @@ class LRUCache {
         // "满"与"接近满"之间震荡——高 zoom 下这种震荡会导致
         // 视口内的瓦片每帧都被驱逐。
         while (this._currentSize > Math.floor(this.maxMemory * 0.90) &&
-               this._usageOrder.length > 0 &&
                evicted < maxEvictions) {
-            const key = this._usageOrder[0];
-            const removedData = this.getAndRemove(key);
-            if (removedData) {
-                this.onRemove(removedData);
-                evicted++;
-            } else {
-                this._usageOrder.shift();
+            if (!this._evictOldest()) {
+                break;
             }
+            evicted++;
         }
 
         return this;
@@ -245,10 +256,8 @@ class LRUCache {
             return null;
         }
         const data = this.data.get(key);
-        this._currentSize -= this._dataSize(key);
+        this._currentSize -= this._estimateSize(data);
         this.data.delete(key);
-        const idx = this._usageOrder.indexOf(key);
-        if (idx !== -1) this._usageOrder.splice(idx, 1);
         return data;
     }
 
@@ -258,10 +267,18 @@ class LRUCache {
      * Without this, frequently-rendered tiles can be evicted before
      * rarely-used tiles just because they were added first.
      *
+     * Moving to MRU is a delete + set on the Map, both O(1); the previous
+     * implementation did indexOf()+splice() on a parallel array, which made
+     * every cache hit O(n) and stalled the frame on large caches.
+     *
      * 真正的 LRU get：返回数据并将键移动到 MRU 端。
      * 这是与原始朴素 Map 实现的关键区别。
      * 若无此机制，频繁渲染的瓦片可能仅因先添加
      * 而在极少使用的瓦片之前被驱逐。
+     *
+     * 移到 MRU 通过 Map 的 delete + set 完成，均为 O(1)；
+     * 此前的实现在并行数组上做 indexOf()+splice()，
+     * 使每次缓存命中都退化为 O(n)，在大缓存上会卡住当前帧。
      */
     get(key) {
         if (!this.has(key)) {
@@ -269,12 +286,10 @@ class LRUCache {
         }
         // Move to end (most recently used)
         // 移动到末尾（最近使用）
-        const idx = this._usageOrder.indexOf(key);
-        if (idx !== -1) {
-            this._usageOrder.splice(idx, 1);
-            this._usageOrder.push(key);
-        }
-        return this.data.get(key);
+        const data = this.data.get(key);
+        this.data.delete(key);
+        this.data.set(key, data);
+        return data;
     }
 
     /**
@@ -296,17 +311,15 @@ class LRUCache {
             return this;
         }
         const data = this.data.get(key);
-        this._currentSize -= this._dataSize(key);
+        this._currentSize -= this._estimateSize(data);
         this.data.delete(key);
-        const idx = this._usageOrder.indexOf(key);
-        if (idx !== -1) this._usageOrder.splice(idx, 1);
         this.onRemove(data);
         return this;
     }
 
     setMaxSize(max) {
         this.max = max;
-        if (this._usageOrder.length > this.max) {
+        if (this.data.size > this.max) {
             this.shrink();
         }
         return this;
@@ -328,7 +341,7 @@ class LRUCache {
 
     /** @internal */
     get size(): number {
-        return this._usageOrder.length;
+        return this.data.size;
     }
 
     /** @internal - estimated memory consumption in bytes */
