@@ -470,11 +470,14 @@ const GLTFMixin = Base =>
             //     meshes = meshes.filter(m => m.properties.tile.terrainTileInfos);
             // }
             const timestamp = context.timestamp;
+            const isRenderingTerrainVector = context.isRenderingTerrain && this.isTerrainVector();
             for (let i = 0; i < meshes.length; i++) {
                 if (!meshes[i] || !meshes[i].geometry) {
                     continue;
                 }
-                if (meshes[i].instancedData.aTerrainAltitude) {
+                if (isRenderingTerrainVector && !meshes[i].instancedData.aTerrainAltitude) {
+                    this._updateTerrainAltitude(meshes[i], meshes[i].instancedData, meshes[i].properties, 3, context);
+                } else if (meshes[i].instancedData.aTerrainAltitude) {
                     this._updateTerrainAltitude(meshes[i], meshes[i].instancedData, meshes[i].properties, 3, context);
                 }
                 const symbolIndex = meshes[i].properties.symbolIndex.index;

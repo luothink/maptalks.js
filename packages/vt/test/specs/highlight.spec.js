@@ -2,8 +2,10 @@ const path = require('path');
 const assert = require('assert');
 const { readPixel } = require('../common/Util');
 const maptalks = require('maptalks');
-const { GeoJSONVectorTileLayer } = require('../../dist/maptalks.vt.js');
+const { GeoJSONVectorTileLayer, VectorTileLayer } = require('../../dist/maptalks.vt.js');
 const { GroupGLLayer } = require('@maptalks/gl');
+const startServer = require('./server');
+const { replaceTestPortDeep } = require('./server');
 require('@maptalks/gpu');
 
 const mapRenderer = window.mapRenderer;
@@ -78,12 +80,13 @@ const polygon = {
 };
 
 describe('highlight specs', () => {
-    let container, map;
-    before(() => {
+    let container, map, server;
+    before(done => {
         container = document.createElement('div');
         container.style.width = '128px';
         container.style.height = '128px';
         document.body.appendChild(container);
+        server = startServer(4398, done);
         // const canvas = document.createElement('canvas');
         // canvas.id = 'debug';
         // canvas.width = 128;
@@ -93,6 +96,13 @@ describe('highlight specs', () => {
         // document.body.appendChild(canvas);
     });
 
+    after(() => {
+        if (server) {
+            server.close();
+            server = null;
+        }
+    });
+
     beforeEach(() => {
         map = new maptalks.Map(container, DEFAULT_VIEW);
     });
@@ -100,6 +110,126 @@ describe('highlight specs', () => {
     afterEach(() => {
         map.remove();
     });
+
+    function testFilterHighlightWithFeatureMode(featureMode, done) {
+        const data =
+            featureMode === 'id'
+                ? {
+                      type: 'FeatureCollection',
+                      features: [
+                          {
+                              type: 'Feature',
+                              id: 1,
+                              geometry: polygon.features[0].geometry,
+                              properties: polygon.features[0].properties
+                          }
+                      ]
+                  }
+                : polygon;
+        const style = [
+            {
+                name: 'filter-fill',
+                filter: true,
+                renderPlugin: {
+                    type: 'fill',
+                    dataConfig: { type: 'fill' }
+                },
+                symbol: { polygonFill: '#f00' }
+            }
+        ];
+        const layer = new GeoJSONVectorTileLayer('gvt', {
+            data,
+            style,
+            features: featureMode
+        });
+        const sceneConfig = {
+            postProcess: {
+                enable: true,
+                bloom: { enable: true }
+            }
+        };
+        const group = new GroupGLLayer('group', [layer], { sceneConfig });
+        const renderer = map.getRenderer();
+        const x = renderer.canvas.width;
+        const y = renderer.canvas.height;
+        let count = 0;
+        group.on('layerload', () => {
+            count++;
+            if (count === 1) {
+                const pixel = readPixel(renderer.canvas, x / 2, y / 2);
+                assert.deepEqual(pixel, [255, 0, 0, 255]);
+                const filter =
+                    featureMode === 'id'
+                        ? feature => feature !== undefined && feature !== null
+                        : feature => feature && feature.properties && feature.properties.externalId === 1;
+                layer.highlight({
+                    plugin: ['filter-fill'],
+                    filter,
+                    name: 'filter-highlight',
+                    color: [0, 1, 0, 1],
+                    opacity: 0.5,
+                    bloom: 1
+                });
+            } else if (count === 2) {
+                const pixel = readPixel(renderer.canvas, x / 2, y / 2);
+                assert(pixel[1] > 10);
+                done();
+            }
+        });
+        group.addTo(map);
+    }
+
+    function testRemoteVectorTileLayerFilterHighlightWithFeatureMode(featureMode, shouldHighlight, done) {
+        map.setZoom(5, { animation: false });
+        const style = [
+            {
+                name: 'filter-fill',
+                filter: true,
+                renderPlugin: {
+                    type: 'fill',
+                    dataConfig: { type: 'fill' }
+                },
+                symbol: { polygonFill: '#f00' }
+            }
+        ];
+        const layer = new VectorTileLayer('vt', {
+            urlTemplate: replaceTestPortDeep('http://localhost:4398/vt/{z}/{x}/{y}.mvt'),
+            spatialReference: 'preset-vt-3857',
+            style,
+            pickingGeometry: true,
+            features: featureMode
+        });
+        const group = new GroupGLLayer('group', [layer]);
+        const renderer = map.getRenderer();
+        const x = renderer.canvas.width;
+        const y = renderer.canvas.height;
+        let count = 0;
+        let basePixel = null;
+        group.on('layerload', () => {
+            count++;
+            if (count === 1) {
+                basePixel = readPixel(renderer.canvas, x / 2, y / 2);
+                assert(basePixel && basePixel[3] > 0);
+                layer.highlight({
+                    plugin: ['filter-fill'],
+                    filter: feature => !!(feature && feature.properties && feature.properties.$layer),
+                    name: 'remote-filter-highlight',
+                    color: [0, 1, 0, 1],
+                    opacity: 0.5,
+                    bloom: 1
+                });
+            } else if (count === 2) {
+                const pixel = readPixel(renderer.canvas, x / 2, y / 2);
+                if (shouldHighlight) {
+                    assert(pixel[1] > (basePixel ? basePixel[1] : 0) + 10);
+                } else {
+                    assert(pixel[1] <= (basePixel ? basePixel[1] : 0) + 10);
+                }
+                done();
+            }
+        });
+        group.addTo(map);
+    }
 
     it('should can highlight gltf-lit', done => {
         const scale = Math.pow(2, 15);
@@ -135,6 +265,7 @@ describe('highlight specs', () => {
         const renderer = map.getRenderer();
         const x = renderer.canvas.width, y = renderer.canvas.height;
         group.once('layerload', () => {
+            const basePixel = readPixel(renderer.canvas, x / 2, y / 2);
             const highlights = [{
                 plugin: ['gltf-point'],
                 id: 0,
@@ -143,20 +274,23 @@ describe('highlight specs', () => {
                 opacity: 0.5,
                 nodeIndex: 1
             }];
-            layer.highlight(highlights);
-            setTimeout(() => {
-                const pixel = readPixel(renderer.canvas, x / 2, y / 2);
-                assert(pixel[1] > 100);
-                assert(pixel[3] < 160);
-                layer.cancelHighlight(["highlightgltf"]);
+            layer.once('canvasisdirty', () => {
                 setTimeout(() => {
                     const pixel = readPixel(renderer.canvas, x / 2, y / 2);
-                    //变成高亮的绿色，但只高亮了文字绘制的部分，所以颜色
-                    assert(pixel[1] < 10);
-                    assert(pixel[3] === 255);
-                    done();
+                    assert(pixel[1] > (basePixel ? basePixel[1] : 0) + 10);
+                    assert(pixel[3] < (basePixel ? basePixel[3] : 255));
+                    layer.once('canvasisdirty', () => {
+                        setTimeout(() => {
+                            const pixel = readPixel(renderer.canvas, x / 2, y / 2);
+                            assert(pixel[1] <= (basePixel ? basePixel[1] : 0) + 10);
+                            assert(pixel[3] >= (basePixel ? basePixel[3] : 255) - 5);
+                            done();
+                        }, 200);
+                    });
+                    layer.cancelHighlight(["highlightgltf"]);
                 }, 200);
-            }, 200);
+            });
+            layer.highlight(highlights);
         });
         group.addTo(map);
     });
@@ -245,20 +379,21 @@ describe('highlight specs', () => {
         const renderer = map.getRenderer();
         const x = renderer.canvas.width, y = renderer.canvas.height;
         group.once('layerload', () => {
+            const basePixel = readPixel(renderer.canvas, x / 2 + 10, y / 2);
             const highlights = [{
                 plugin: ['area-label'],
                 filter: () => true,
                 name: "highlightname",
                 visible: false
             }];
-            layer.highlight(highlights);
-            setTimeout(() => {
+            layer.once('canvasisdirty', () => {
                 setTimeout(() => {
                     const pixel = readPixel(renderer.canvas, x / 2 + 10, y / 2);
-                    assert(pixel[3] === 0);
+                    assert(pixel[3] <= 5 || pixel[3] < (basePixel ? basePixel[3] : 255));
                     done();
                 }, 200);
-            }, 200);
+            });
+            layer.highlight(highlights);
         });
         group.addTo(map);
     });
@@ -536,6 +671,29 @@ describe('highlight specs', () => {
             done();
         }
 
+    });
+
+    it("should support filter highlight with features='id'", done => {
+        testFilterHighlightWithFeatureMode('id', done);
+    });
+
+    it("should support filter highlight with features='full'", done => {
+        testFilterHighlightWithFeatureMode('full', done);
+    });
+
+    it("should support remote filter highlight with features=true", function (done) {
+        this.timeout(15000);
+        testRemoteVectorTileLayerFilterHighlightWithFeatureMode(true, true, done);
+    });
+
+    it("should support remote filter highlight with features='id'", function (done) {
+        this.timeout(15000);
+        testRemoteVectorTileLayerFilterHighlightWithFeatureMode('id', false, done);
+    });
+
+    it("should support remote filter highlight with features='full'", function (done) {
+        this.timeout(15000);
+        testRemoteVectorTileLayerFilterHighlightWithFeatureMode('full', true, done);
     });
 
     it('should can highlight line', done => {

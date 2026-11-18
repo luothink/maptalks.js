@@ -13,6 +13,43 @@ const points = {
     ]
 };
 
+const pointStyle = {
+    $root: '.',
+    resources: [],
+    style: [
+        {
+            renderPlugin: { type: 'native-point', dataConfig: { type: 'native-point' }, sceneConfig: {} },
+            symbol: { markerType: 'square', markerSize: 20 }
+        }
+    ]
+};
+
+function cloneStyle() {
+    return JSON.parse(JSON.stringify(pointStyle));
+}
+
+function verifyFeaturePayloadRequest(layer, map, expected, done) {
+    layer.once('workerready', () => {
+        const renderer = layer.getRenderer();
+        const workerConn = renderer && renderer._workerConn;
+        const originalLoadTile = workerConn.loadTile;
+        let checked = false;
+        workerConn.loadTile = function (context, cb) {
+            if (!checked) {
+                checked = true;
+                assert.strictEqual(context.requireFullFeatureJSON, expected);
+            }
+            return originalLoadTile.call(this, context, cb);
+        };
+        layer.once('layerload', () => {
+            workerConn.loadTile = originalLoadTile;
+            assert.ok(checked);
+            done();
+        });
+        map.setZoom(map.getZoom() - 1, { animation: false });
+    });
+}
+
 describe('GeoJSONVectorTileLayer', () => {
     let map, container;
     beforeEach(() => {
@@ -106,6 +143,26 @@ describe('GeoJSONVectorTileLayer', () => {
                 done();
             }
         });
+    });
+
+    it('should not request full feature payload when featuresTypeArray is unnecessary', done => {
+        const layer = new GeoJSONVectorTileLayer('gvt', {
+            data: points,
+            style: cloneStyle(),
+            features: true
+        });
+        layer.addTo(map);
+        verifyFeaturePayloadRequest(layer, map, false, done);
+    });
+
+    it('should request featuresTypeArray in full feature mode', done => {
+        const layer = new GeoJSONVectorTileLayer('gvt', {
+            data: points,
+            style: cloneStyle(),
+            features: 'full'
+        });
+        layer.addTo(map);
+        verifyFeaturePayloadRequest(layer, map, true, done);
     });
 
     it('should can be serialized', done => {

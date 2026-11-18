@@ -6,7 +6,9 @@ class MeshShader extends Shader {
         if (!meshes || !meshes.length) {
             return 0;
         }
-        const props = [];
+        // 复用实例级数组，避免每帧每 draw 调用创建新的 props 数组（降低 GC 压力）。
+        // draw 为同步执行，run 内部 command(props) 同步消费完后即可安全清空复用。
+        const props = this._drawProps || (this._drawProps = []);
         let count = 0;
         let preCommand;
         for (let i = 0, l = meshes.length; i < l; i++) {
@@ -56,6 +58,7 @@ class MeshShader extends Shader {
                 this.run(device, command, props);
             }
         }
+        props.length = 0;
         return count;
     }
 

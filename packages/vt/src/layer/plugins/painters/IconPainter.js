@@ -230,7 +230,7 @@ class IconPainter extends CollisionPainter {
         const enableUniquePlacement = this.isEnableUniquePlacement();
         const markerMeshes = createMarkerMesh.call(this, this.regl, geometry, transform, symbolDef, symbol, fnTypeConfig, layer.options['collision'], !enableCollision, enableUniquePlacement);
 
-        if (markerMeshes.length) {
+        if (markerMeshes && markerMeshes.length) {
             const positionMatrix = this.getAltitudeOffsetMatrix();
             markerMeshes[0].positionMatrix = positionMatrix;
             if (markerMeshes[1]) {
@@ -392,7 +392,13 @@ class IconPainter extends CollisionPainter {
         }
         let meshes = this._meshesToCheck;
         if (!meshes || !meshes.length) {
-            return;
+            // _meshesToCheck 为空说明非 pan+新增mesh 场景（如缩放/旋转），
+            // 需要全量重建碰撞：屏幕位置已随缩放/旋转变化，
+            // 旧 mesh 必须重新参与碰撞检测，否则标注可能错误显示/隐藏
+            meshes = this.scene.getMeshes();
+            if (!meshes || !meshes.length) {
+                return;
+            }
         }
 
         this._updateIconAndText(meshes);
@@ -412,7 +418,8 @@ class IconPainter extends CollisionPainter {
         meshes = meshes.sort(sortByLevel);
         for (let m = 0; m < meshes.length; m++) {
             const mesh = meshes[m];
-            if (!mesh || !mesh.meshes.length) {
+            // 跳过被 LRU 淘汰/数据刷新 dispose 的 mesh（properties 被置为 null）
+            if (!mesh || !mesh.properties || !mesh.meshes || !mesh.meshes.length) {
                 continue;
             }
             let isIterable = false;
@@ -852,6 +859,10 @@ class IconPainter extends CollisionPainter {
 // }
 
 function sortByLevel(m0, m1) {
+    // 防御：tile 被 LRU 淘汰或数据刷新时 mesh 可能已 dispose（properties 被置 null）
+    if (!m0 || !m0.properties || !m1 || !m1.properties) {
+        return 0;
+    }
     return m0.properties.level - m1.properties.level || m0.properties.meshKey - m1.properties.meshKey;
 }
 

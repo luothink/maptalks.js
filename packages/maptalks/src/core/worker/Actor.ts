@@ -169,7 +169,15 @@ class Actor {
         const data = message.data,
             id = data.callback;
         const callback = this.callbacks[id];
-        delete this.callbacks[id];
+        // 瓦片按要素类型"拆分回传"（partial→pointOnly）时，同一回调会被连续调用两次：
+        // 第一次是 partial（data.partial===true，线/面快组先上屏），随后到达的
+        // pointOnly（仅点要素补充）仍复用同一回调 id。若这里取走即删，第二次回调
+        // 将被静默丢弃，主线程永远收不到 pointOnly → 点/文本要素数据无法合并进瓦片，
+        // 表现为点要素与文本永不渲染。因此 partial 到达时保留回调，等 pointOnly
+        // （无 partial 标记）到达后自然删除；其余请求（含 canceled/error）照旧删除。
+        if (!(data.data && data.data.partial)) {
+            delete this.callbacks[id];
+        }
         if (data.type === '<request>') {
             if (this.actorId === data.actorId) {
                 //request from worker to main thread

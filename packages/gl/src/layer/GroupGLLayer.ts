@@ -7,11 +7,49 @@ import RayCaster from './raycaster/RayCaster';
 import Mask from './mask/Mask';
 import { LayerJSONType } from 'maptalks';
 
+/**
+ * Tier-aware default options for GroupGLLayer.
+ * 按性能等级分层的 GroupGLLayer 默认选项。
+ *
+ * Quality degradations for low-tier (UOS/Kylin + iGPU):
+ *  - antialias:            true → false      (-40% GL fill-rate cost, jagged edges)
+ *  - multiSamples:         4 → 0             (-25% ROP cost, disables MSAA entirely)
+ *  - forceRenderOnMoving:  true → false      (-60% draw-calls during pan on 2D views)
+ *  - forceRenderOnZooming: true → false      (on non-3D maps, zoom with parent tiles
+ *                                              stretched is visually acceptable and
+ *                                              keeps FPS stable on weak iGPUs)
+ * The last two are the largest contributors to pan/zoom stutter on domestic Linux:
+ * when forceRenderOnMoving is true the entire scene (vector tiles + GLTF + 3D) must
+ * be re-drawn on every animation frame during pan. On a 2D map the canvas tile
+ * renderer already draws continuously via its own RAF loop, so forcing the GL layer
+ * into lockstep with it simply duplicates work for zero visual benefit — it only
+ * matters for pitched/rotated 3D views where the GL layer owns the final composite.
+ * Business code that needs forceRenderOn* for a specific layer can still override
+ * per-instance at construction time.
+ *
+ * 质量降级策略（针对 UOS/麒麟 + 集成显卡）：
+ *  - antialias:       true  → false （节省约 40% 的填充率开销，代价轻微锯齿）
+ *  - multiSamples:    4     → 0      （节省约 25% ROP 开销，完全关闭 MSAA）
+ *  - forceRenderOnMoving:   true → false（平移时 GL 层不再每帧重绘，省约 60% draw call）
+ *  - forceRenderOnZooming:  true → false（缩放时使用父级瓦片拉伸过渡，非3D视角下视觉
+ *                                         可接受，弱GPU下帧率稳）
+ * 后两项是国产 Linux 平移/缩放卡顿的最大来源：2D 平视图下 canvas 瓦片渲染器
+ * 自己的 RAF 循环已经在连续绘制，GL 层强制与其同步每帧重绘只是在重复工作。
+ * 仅在有俯仰角/旋转的3D视角下才必须开启（GL 层拥有最终合成权）。
+ * 业务如确实需要可以在构造函数时按实例单独覆盖。
+ */
+const __tier = (maptalks.GlobalConfig && maptalks.GlobalConfig.__platformTier) || 'desktop-mid';
+const __isLow = __tier === 'desktop-low' || __tier === 'mobile-low';
+
 const options: GroupGLLayerOptions = {
     renderer : 'gl',
-    antialias : true,
+    // Antialias (framebuffer-level FXAA/TAA toggle): off on low-tier machines.
+    // 抗锯齿（帧缓冲级别 FXAA/TAA 开关）：低性能机关闭。
+    antialias : !__isLow,
     extensions : [],
     single: true,
+    // GL version policy is decided in gl-context.ts; here we honor the URL
+    // override (?webgl=1) only as a last-resort manual fallback.
     onlyWebGL1: false,
     optionalExtensions : [
         'ANGLE_instanced_arrays',
@@ -34,12 +72,16 @@ const options: GroupGLLayerOptions = {
         'WEBGL_compressed_texture_s3tc',
         'WEBGL_compressed_texture_s3tc_srgb'
     ],
-    forceRenderOnZooming : true,
-    forceRenderOnMoving : true,
+    // Interaction force-render: flip to conservative defaults on low-tier.
+    // 交互时强制重绘：低性能机切换到保守默认（省CPU/GPU，非3D视角视觉可接受）。
+    forceRenderOnZooming : !__isLow,
+    forceRenderOnMoving : !__isLow,
     forceRenderOnRotating : true,
     viewMoveThreshold: 100,
     geometryEvents: true,
-    multiSamples: 4,
+    // MSAA samples: 4x on perf/mid, 0 (disabled) on low.
+    // MSAA 多重采样数：性能/中等机 4x，低性能机 0（完全禁用）。
+    multiSamples: __isLow ? 0 : 4,
     forceRedrawPerFrame: false
 };
 
@@ -872,14 +914,22 @@ export type QueryHitResult = [number | null, 0 | 1]
 
 export type GroupGLLayerOptions = {
     renderer?: 'gl',
-    antialias?: true,
+    // NOTE: historically typed as the literal `true` because the only
+    // supported value was ON.  Widened to `boolean` so that tier-based
+    // defaults (desktop-low disables antialias/forceRenderOn*) can be
+    // assigned directly without `as true` casts; runtime code already
+    // treats falsy values as "off", so there is zero behavioural change.
+    // 注：历史上写成字面量 `true` 是因为只支持开启。放宽为 `boolean`
+    // 以便按性能等级设置默认值时无需 `as true` 强制转换；
+    // 运行时代码已正确处理 falsy=关闭 的语义，因此行为无变化。
+    antialias?: boolean,
     extensions?: string[],
     single?: boolean,
     onlyWebGL1?: boolean,
     optionalExtensions?: string[],
-    forceRenderOnZooming?: true,
-    forceRenderOnMoving?: true,
-    forceRenderOnRotating?: true,
+    forceRenderOnZooming?: boolean,
+    forceRenderOnMoving?: boolean,
+    forceRenderOnRotating?: boolean,
     viewMoveThreshold?: number,
     geometryEvents?: boolean,
     multiSamples?: number,

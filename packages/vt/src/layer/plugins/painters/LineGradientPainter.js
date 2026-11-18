@@ -136,6 +136,9 @@ class LineGradientPainter extends LinePainter {
         this.setLineUniforms(symbol, uniforms);
 
         const texture = this._genGradientTexture(geometry.properties.gradients);
+        if (!texture) {
+            return null;
+        }
         uniforms['lineGradientTexture'] = texture;
         uniforms['lineGradientTextureHeight'] = texture.height;
 
@@ -163,6 +166,9 @@ class LineGradientPainter extends LinePainter {
     }
 
     _genGradientTexture(gradients) {
+        if (!gradients || !gradients.length) {
+            return;
+        }
         const height = gradients.length * 2;
         //TODO webgpu
         const texture = this.regl.texture({
@@ -218,6 +224,9 @@ class LineGradientPainter extends LinePainter {
 export default LineGradientPainter;
 
 function createGradient(grads) {
+    if (!grads || !grads.length) {
+        return document.createElement('canvas');
+    }
     if (grads.length > GRADIENTS_COUNT_TO_WARN) {
         console.warn(`Gradients count is (${grads.length}), it may be slow to render.`);
     }

@@ -85,21 +85,33 @@ class TileLayerGLRenderer2 extends TexturePoolable(CanvasCompatible(TileLayerRen
 
     _drawCurrentTiles(tiles, parentTiles) {
         super._drawCurrentTiles(tiles, parentTiles);
-        this._submitMeshes(parentTiles);
+        // Defer submission - meshes are accumulated and submitted once in onDrawTileEnd
+        // to reduce WebGL draw calls from 3-4 per frame to 1.
+        // The stencil test (per-mesh zoom ref) ensures correct depth ordering
+        // even within a single batched draw call.
+        // 延迟提交——网格先累积，统一在 onDrawTileEnd 中一次性提交，
+        // 将每帧 WebGL 绘制调用从 3-4 次降为 1 次。
+        // 模板测试（每个 mesh 的 zoom ref）保证即使在单次批量绘制中
+        // 也能维持正确的深度顺序。
     }
 
     _drawChildTiles(childTiles, parentContext) {
         super._drawChildTiles(childTiles, parentContext);
-        this._submitMeshes(parentContext);
-
+        // 只做瓦片内容绘制，mesh 累积统一推迟到 onDrawTileEnd 批量提交。
+        // Only paints child tile contents; mesh accumulation submission is deferred to onDrawTileEnd in one batched call.
     }
 
     _drawParentTiles(parentTiles, parentContext) {
-        super._drawChildTiles(parentTiles, parentContext);
-        this._submitMeshes(parentContext);
+        super._drawParentTiles(parentTiles, parentContext);
+        // 同上，父瓦片 mesh 不单独提交，与 current/child 合并后批量绘制。
+        // Same as child tiles — parent meshes aren't submitted alone; all three tile sets get batched together.
     }
 
     onDrawTileEnd(_, parentContext: RenderContext) {
+        // Single batched draw call: all current + child + parent tile meshes
+        // are accumulated in _tileMeshes and submitted together.
+        // 单次批量绘制调用：current + child + parent 瓦片的所有网格
+        // 先累积到 _tileMeshes 中，再统一提交。
         this._submitMeshes(parentContext);
     }
 
@@ -172,7 +184,10 @@ class TileLayerGLRenderer2 extends TexturePoolable(CanvasCompatible(TileLayerRen
             mesh.setDefines({});
         }
 
-        updateFilter(mesh, map, tileInfo.res);
+        // 传入缩放/惯性态标志，让 imageMesh 的过滤器选择在视图变化期间保持稳定，
+        // 避免 LINEAR ↔ NEAREST 逐帧切换造成的瓦片边缘闪烁。
+        // Forward the zooming/settling flag so imageMesh's filter selection stays stable while the view is in motion.
+        updateFilter(mesh, map, tileInfo.res, (this as any)._isZoomingOrSettling);
 
         let opacity = this.getTileOpacity(tileImage, tileInfo);
         let layerOpacity = this.layer.options['opacity'];
@@ -181,9 +196,22 @@ class TileLayerGLRenderer2 extends TexturePoolable(CanvasCompatible(TileLayerRen
         }
         opacity *= layerOpacity;
 
-
-        mesh.material.set('opacity', opacity);
-        mesh.setUniform('isCurrentTiles', +!!this.drawingCurrentTiles);
+        // Cache opacity per-mesh: only call material.set() when value actually changes.
+        // Avoids triggering uniform dirty flags and recomputation every frame.
+        // 逐网格缓存透明度：仅当值真正变化时才调用 material.set()，
+        // 避免每帧都触发 uniform 脏标记和重复计算。
+        const props = mesh.properties;
+        if (props._lastOpacity !== opacity) {
+            props._lastOpacity = opacity;
+            mesh.material.set('opacity', opacity);
+        }
+        // 同样缓存 isCurrentTiles uniform，避免每帧都走一次 uniform 脏标记刷新路径。
+        // Same caching pattern for isCurrentTiles uniform — skips the uniform dirty-flag refresh on unchanged frames.
+        const isCurrent = +!!this.drawingCurrentTiles;
+        if (props._lastIsCurrentTiles !== isCurrent) {
+            props._lastIsCurrentTiles = isCurrent;
+            mesh.setUniform('isCurrentTiles', isCurrent);
+        }
         this._tileMeshes.push(mesh);
         if ((this as any).getTileFadingOpacity(tileImage) < 1) {
             this.setToRedraw();
@@ -193,10 +221,20 @@ class TileLayerGLRenderer2 extends TexturePoolable(CanvasCompatible(TileLayerRen
     _createDebugTexture(tileInfo: Tile['info'], width, height) {
         const debugInfo = this.getDebugInfo(tileInfo.id);
         const dpr = this.getMap().getDevicePixelRatio() > 1 ? 2 : 1;
-        const canvas = this._debugInfoCanvas = document.createElement('canvas');
-        canvas.width = width * dpr;
-        canvas.height = height * dpr;
+        // reuse debug canvas to avoid per-frame canvas allocation.
+        // Previously a new canvas was created every frame, leaking 256KB+ per debug tile.
+        // 复用 debug canvas，避免每帧新建 canvas。
+        // 之前每帧都会创建一个新 canvas，每个 debug 瓦片泄漏 256KB+ 内存。
+        let canvas = this._debugInfoCanvas;
+        if (!canvas || canvas.width !== width * dpr || canvas.height !== height * dpr) {
+            canvas = this._debugInfoCanvas = document.createElement('canvas');
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+        }
         const ctx = canvas.getContext('2d');
+        // 复用 canvas 前必须清空，否则上一帧 debug 文字/边框会残留在新帧。
+        // Mandatory clear before reusing the canvas; otherwise the previous frame's debug text and border bleed through.
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.font = '20px monospace';
         ctx.scale(dpr, dpr);
         const color = this.layer.options['debugOutline'];
@@ -254,9 +292,27 @@ class TileLayerGLRenderer2 extends TexturePoolable(CanvasCompatible(TileLayerRen
         }
         const image = tile.image as any;
         if (image.texture) {
+            // Prevent pooled textures from retaining the closed tile ImageBitmap reference.
+            // The GPU data is uploaded; clearing CPU-side image refs saves JS heap.
+            // 防止纹理池中的纹理保留已关闭的瓦片 ImageBitmap 引用。
+            // GPU 数据已上传完毕，清除 CPU 侧的图像引用可节省 JS 堆内存。
+            const cfg = image.texture.config;
+            if (cfg) {
+                if (cfg.data && (cfg.data as any).close) {
+                    cfg.data = null;
+                }
+                cfg.image = null;
+            }
             this.saveTexture(image.texture as any);
         }
         if (image.debugTexture) {
+            const cfg = image.debugTexture.config;
+            if (cfg) {
+                if (cfg.data && (cfg.data as any).close) {
+                    cfg.data = null;
+                }
+                cfg.image = null;
+            }
             this.saveTexture(image.debugTexture as any);
         }
         delete image.texture;
@@ -356,11 +412,18 @@ class TileLayerGLRenderer2 extends TexturePoolable(CanvasCompatible(TileLayerRen
             if (!tile.image) {
                 continue;
             }
-            const canvas = document.createElement('canvas');
-            skinImages[i].canvas = canvas;
-            canvas.width = tileSize;
-            canvas.height = tileSize;
+            // 优化：重用已有的 canvas，避免每帧创建新对象导致 GC 压力
+            let canvas = skinImages[i].canvas;
+            if (!canvas || canvas.width !== tileSize || canvas.height !== tileSize) {
+                canvas = document.createElement('canvas');
+                canvas.width = tileSize;
+                canvas.height = tileSize;
+                skinImages[i].canvas = canvas;
+            }
             const ctx = canvas.getContext('2d');
+            // 复用皮肤 canvas 前清空，防止旧瓦片图像与新瓦片叠加出脏像素。
+            // Clear the reused skin canvas before drawing so pixels from the previous tile don't composite with the new one.
+            ctx.clearRect(0, 0, tileSize, tileSize);
             ctx.drawImage(tile.image, 0, 0);
             if (debug) {
                 const { x, y, z } = tile.info;
@@ -371,6 +434,12 @@ class TileLayerGLRenderer2 extends TexturePoolable(CanvasCompatible(TileLayerRen
                 width: tileSize,
                 height: tileSize,
                 flipY: true,
+                // 皮肤合成使用 src: one 的预乘混合，纹理数据必须显式预乘 alpha，
+                // 否则注记等透明图层的透明像素/抗锯齿边缘会被整值叠加，产生亮度不一致。
+                // Premultiply alpha explicitly required because skin composite uses src=ONE blending;
+                // without it transparent pixels / anti-aliased edges on labels get additively doubled
+                // and brightness varies across frames.
+                premultiplyAlpha: true,
                 min: 'linear mipmap linear',
                 mag: 'linear'
             };

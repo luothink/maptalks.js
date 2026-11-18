@@ -75,6 +75,21 @@ class Painter extends Class {
     _cachedParams: any;
     //@internal
     _unsimpledParams: any;
+    //@internal 渲染器侧是否已完成本 Painter 投影点的批量坐标预转换（true 时 pointsContainerPoints 可直接取 _pt 跳过重复转换）。
+    // Renderer-side flag: true when the renderer has already bulk-converted this painter's projected points to container coordinates in one pass.
+    _batchApplied: boolean;
+    //@internal 批量转换时使用的 GL 分辨率，命中批量缓存前需与 rendererStateCache.glRes 比对一致。
+    // GL resolution used during the last bulk conversion; must match rendererStateCache.glRes before the batch cache is valid.
+    _batchGlRes: number;
+    //@internal 批量转换时的 pitch，与当前帧状态不一致则批量缓存失效。
+    // Pitch value captured during the last bulk conversion; any mismatch invalidates the batch cache.
+    _batchPitch: number;
+    //@internal 批量转换时的 bearing，同上。
+    // Bearing value captured during the last bulk conversion; same invalidation rule as _batchPitch.
+    _batchBearing: number;
+    //@internal 批量转换时的容器偏移 Point（引用比较），用于判定是否可以复用批量结果。
+    // Container-offset Point (compared by reference) from the last bulk conversion; identity check guards against reusing the cache when the offset has changed.
+    _batchOffset: Point;
     //@internal
     _spriting: boolean;
     //@internal
@@ -215,29 +230,12 @@ class Painter extends Class {
         return this._renderPoints[placement];
     }
 
-    /**
-     * for strokeAndFillSymbolizer
-     * @return resources to render vector
-     */
-    getPaintParams(dx: number, dy: number, ignoreAltitude: boolean, disableClip: boolean, ptkey = '_pt', isGround) {
-        const renderer = this.getLayer()._getRenderer();
-        const rendererStateCache = renderer.rendererStateCache;
-        let resolution, pitch, bearing, glScale, containerExtent;
-        const map = this.getMap();
-        if (rendererStateCache && (!this._hitPoint)) {
-            resolution = rendererStateCache.resolution;
-            pitch = rendererStateCache.pitch;
-            bearing = rendererStateCache.bearing;
-            glScale = rendererStateCache.glScale;
-            containerExtent = rendererStateCache.containerExtent;
-        } else {
-            const cache = MapStateCache[map.id];
-            resolution = map.getResolution();
-            pitch = cache ? cache.pitch : map.getPitch();
-            bearing = cache ? cache.bearing : map.getBearing();
-            glScale = map.getGLScale();
-            containerExtent = map.getGroundExtent();
-        }
+    //@internal 从 geometry 缓存或重算获取当前分辨率/pitch/bearing 下的绘制参数（包含 params[0] 投影点数组）。
+    // 拆分自 getPaintParams，供渲染器批量取出投影点进行批量坐标预转换使用。
+    // Gets cached (or freshly computed) paint params for the given resolution/pitch/bearing,
+    // including params[0] the projected-point array. Extracted from getPaintParams so the renderer
+    // can bulk-fetch projected points without triggering the full paint-param pipeline.
+    _getCachedParams(resolution: number, pitch: number, bearing: number) {
         const geometry = this.geometry,
             res = resolution,
             pitched = (pitch !== 0),
@@ -272,17 +270,83 @@ class Painter extends Class {
                 }
             }
             this._cachedParams = params;
+            // 投影点已变化，使批量坐标转换缓存失效
+            this._batchApplied = false;
         }
         if (!params) {
             return null;
         }
         this._pitched = pitched;
         this._rotated = rotated;
+        return params;
+    }
+
+    /**
+     * 获取当前分辨率下缓存的投影点（params[0]），供渲染器做批量坐标转换使用
+     * @internal
+     */
+    getProjectionPoints(): any[] {
+        const layer = this.getLayer();
+        const renderer = layer && layer._getRenderer();
+        const rendererStateCache = renderer && renderer.rendererStateCache;
+        const map = this.getMap();
+        let resolution, pitch, bearing;
+        if (rendererStateCache && (!this._hitPoint)) {
+            resolution = rendererStateCache.resolution;
+            pitch = rendererStateCache.pitch;
+            bearing = rendererStateCache.bearing;
+        } else if (map) {
+            const cache = MapStateCache[map.id];
+            resolution = map.getResolution();
+            pitch = cache ? cache.pitch : map.getPitch();
+            bearing = cache ? cache.bearing : map.getBearing();
+        } else {
+            return null;
+        }
+        const params = this._getCachedParams(resolution, pitch, bearing);
+        if (!params) {
+            return null;
+        }
+        return params[0];
+    }
+
+    /**
+     * for strokeAndFillSymbolizer
+     * @return resources to render vector
+     */
+    getPaintParams(dx: number, dy: number, ignoreAltitude: boolean, disableClip: boolean, ptkey = '_pt', isGround) {
+        const renderer = this.getLayer()._getRenderer();
+        const rendererStateCache = renderer.rendererStateCache;
+        let resolution, pitch, bearing, glScale, containerExtent;
+        const map = this.getMap();
+        if (rendererStateCache && (!this._hitPoint)) {
+            resolution = rendererStateCache.resolution;
+            pitch = rendererStateCache.pitch;
+            bearing = rendererStateCache.bearing;
+            glScale = rendererStateCache.glScale;
+            containerExtent = rendererStateCache.containerExtent;
+        } else {
+            const cache = MapStateCache[map.id];
+            resolution = map.getResolution();
+            pitch = cache ? cache.pitch : map.getPitch();
+            bearing = cache ? cache.bearing : map.getBearing();
+            glScale = map.getGLScale();
+            containerExtent = map.getGroundExtent();
+        }
+        // 走拆分后的缓存方法获取投影点 + 元数据，命中缓存则直接复用无需重算。
+        // Grab projected points + metadata via the extracted cached-params helper; hits cache when view state hasn't changed.
+        const params = this._getCachedParams(resolution, pitch, bearing);
+        if (!params) {
+            return null;
+        }
         const zoomScale = glScale,
             // paintParams = this._paintParams,
             tr = [], // transformed params
             points = params[0];
 
+        // 局部变量缓存 geometry 引用，下方 cPoints 计算需要多次访问，避免重复属性查找。
+        // Local alias for geometry — referenced multiple times in the cPoints computation; eliminates repeated .geometry property lookups.
+        const geometry = this.geometry;
         const mapExtent = containerExtent;
         const isPolygon = !!geometry.getHoles;
         const cPoints = this._pointContainerPoints(points, dx, dy, ignoreAltitude, disableClip || this._hitPoint && !mapExtent.contains(this._hitPoint), null, ptkey, isPolygon, isGround);
@@ -316,6 +380,8 @@ class Painter extends Class {
         const map = this.getMap(),
             geometry = this.geometry,
             containerOffset = this.containerOffset;
+        // 嵌套普通函数 pointsContainerPoints 内无法使用 this，需通过闭包变量引用 painter
+        const painter = this;
         let glRes: number, containerExtent: Extent;
         if (rendererStateCache) {
             glRes = rendererStateCache.glRes;
@@ -386,8 +452,33 @@ class Painter extends Class {
                     }
                 }
             }
-            let pts = getPointsResultPts(filterPoints, ptkey);
-            pts = map._pointsAtResToContainerPoints(filterPoints, glRes, alts, pts);
+            //批量坐标转换优化：若投影点已在渲染器中被批量转换（当前视图状态一致、未裁剪、无高程、默认ptkey），直接复用结果，避免逐几何重复转换
+            const batchCached = painter._batchApplied && rendererStateCache &&
+                painter._batchGlRes === glRes &&
+                painter._batchPitch === rendererStateCache.pitch &&
+                painter._batchBearing === rendererStateCache.bearing &&
+                containerOffset === painter._batchOffset &&
+                ptkey === '_pt' &&
+                filterPoints === points &&
+                !altitudesHasData(alts);
+            let pts;
+            if (batchCached) {
+                //getPointsResultPts 会将 _pt 清零，不能走它；批量转换后各点的 _pt 已是最新的容器坐标，直接复用
+                pts = new Array(filterPoints.length);
+                for (let i = 0, len = filterPoints.length; i < len; i++) {
+                    const fp = filterPoints[i];
+                    pts[i] = fp ? fp._pt : null;
+                }
+                //一次性消费：下方会对 _pt 就地做 _sub(containerOffset) 偏移，
+                //若同一几何有多个 symbolizer 重复进入此处，会导致二次偏移、绘制错位。
+                //消费一次后回退到常规转换（getPointsResultPts 会先清零再重填，结果正确）。
+                painter._batchApplied = false;
+            } else {
+                // 批量缓存未命中或已消费：标准路径——先清零 _pt，再逐点做坐标转换。
+                // Cache miss or already consumed — standard path: zero _pt fields first, then convert point-by-point as usual.
+                pts = getPointsResultPts(filterPoints, ptkey);
+                pts = map._pointsAtResToContainerPoints(filterPoints, glRes, alts, pts);
+            }
             for (let i = 0, len = pts.length; i < len; i++) {
                 const p = pts[i];
                 p._sub(containerOffset);

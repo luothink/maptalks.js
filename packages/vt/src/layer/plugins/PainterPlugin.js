@@ -15,12 +15,17 @@ const EMPTY_ARRAY = [];
 let meshUID = 1;
 /**
  * Create a VT Plugin with a given painter
+ * 【中文】使用指定的 Painter 类创建一个矢量瓦片渲染插件（VT Plugin），
+ * 【中文】用于将该 painter 的绘制结果（mesh / stencil / 纹理）合并到图层的场景中。
  */
 function createPainterPlugin(type, Painter) {
     const PainterPlugin = VectorTilePlugin.extend(type, {
 
         init: function () {
             this._meshCache = {};
+            // 缓存每个瓦片 key 对应的 stencil level 值，跨帧复用 mesh 场景下，
+            // 当 level 未变化时跳过对每个 mesh 的属性写入操作，降低 CPU 开销。
+            this._tileLevels = {};
         },
 
         isVisible() {
@@ -58,9 +63,23 @@ function createPainterPlugin(type, Painter) {
                 this._excludesFunc = excludes ? createFilter(excludes) : null;
                 this._excludes = excludes;
             }
-            //先清除所有的tile mesh, 在后续的paintTile中重新加入，每次只绘制必要的tile
-            painter.startFrame(context);
-            this._frameCache = {};
+            //无入场动画且非地形矢量时，mesh 跨帧持久保留（仅新增/删除 tile 时更新），
+            //避免每帧全量 clear + 重新 addMesh + 排序，显著降低拖动/静止时的 CPU 开销
+            const hasAnimation = !!sceneConfig.animation;
+            const isTerrainVector = !!(painter.isTerrainVector && painter.isTerrainVector());
+            this._hasAnimation = hasAnimation;
+            if (hasAnimation || isTerrainVector) {
+                //有入场动画或地形矢量时，维持每帧重建 mesh 的旧行为
+                painter.startFrame(context);
+                this._frameCache = {};
+                this._paintedKeys = null;
+            } else {
+                painter.startFrame(context, true);
+                if (!this._frameCache) {
+                    this._frameCache = {};
+                }
+                this._paintedKeys = {};
+            }
         },
 
         updateCollision: function (context) {
@@ -82,9 +101,77 @@ function createPainterPlugin(type, Painter) {
         endFrame: function (context) {
             const painter = this.painter;
             if (painter && painter.isVisible()) {
+                // 移除本帧未绘制的 tile mesh（tile 离开视口），保留 mesh 缓存以便复用。
+                // 以下两种情况本帧未绘制的 tile 可能仍在视口，不能清理：
+                // 1. 交互/动画过程中（旧 zoom 过渡瓦片仍作为背景显示）；
+                // 2. 相机已静止但瓦片仍在异步加载（tilesLoading 非空）：
+                //    此时旧 zoom 的背景 mesh 不再被 paintTile，但新瓦片尚未就绪，
+                //    一旦清理会把仍在屏幕上的背景瓦片移除，造成出图后消失/大面积空白。
+                // 因此仅当相机静止且当前无瓦片加载时才执行清理。
+                if (this._paintedKeys) {
+                    const map = context.layer && context.layer.getMap && context.layer.getMap();
+                    const isInteracting = !!(map && map.isInteracting && map.isInteracting());
+                    const isMoving = !!(map && map.isMoving && map.isMoving());
+                    const isZooming = !!(map && map.isZooming && map.isZooming());
+                    const renderer = context.layer && context.layer.getRenderer && context.layer.getRenderer();
+                    const tilesLoadingCount = renderer && renderer.tilesLoading ? Object.keys(renderer.tilesLoading).length : 0;
+                    if (!isInteracting && !isMoving && !isZooming && tilesLoadingCount === 0) {
+                        this._removeStaleTileMeshes(context);
+                    }
+                    this._paintedKeys = null;
+                }
+                this._flushDisposeQueue();
                 return painter.render(context);
             }
             return null;
+        },
+
+        // 清理瓦片数据刷新时延迟 dispose 的旧 mesh（新 mesh 已加入 scene 后再释放，
+        // 避免缩放重解析期间出现帧间空白）
+        _flushDisposeQueue() {
+            const queue = this._disposeQueue;
+            if (queue && queue.length) {
+                this._disposeQueue = [];
+                for (let i = 0; i < queue.length; i++) {
+                    if (queue[i]) {
+                        this.painter.deleteMesh(queue[i]);
+                    }
+                }
+            }
+        },
+
+        _removeStaleTileMeshes(context) {
+            const frameCache = this._frameCache;
+            const paintedKeys = this._paintedKeys;
+            const meshCache = this._meshCache;
+            if (!frameCache) {
+                return;
+            }
+            // 第二道防线：瓦片 id 级别判断。
+            // 某些情况下瓦片仍位于当前视口（tilesInView）但本帧未被 paintTile
+            // （例如瓦片数据重解析的过渡帧），此时必须保留其 mesh 作为背景，
+            // 否则会出现局部区域出图后消失。
+            const renderer = context && context.layer && context.layer.getRenderer && context.layer.getRenderer();
+            const tilesInView = renderer && renderer.tilesInView;
+            for (const key in frameCache) {
+                if (!paintedKeys[key]) {
+                    const meshes = meshCache[key];
+                    if (tilesInView && meshes && meshes.length) {
+                        const tile = meshes[0].properties && meshes[0].properties.tile;
+                        if (tile && tile.id && tilesInView[tile.id]) {
+                            // 瓦片仍在视口内，仅本帧未绘制（数据加载/过渡），保留背景 mesh
+                            continue;
+                        }
+                    }
+                    if (meshes && meshes.length) {
+                        this.painter.removeMeshFromScene(meshes);
+                    }
+                    delete frameCache[key];
+                    if (this._tileLevels) {
+                        delete this._tileLevels[key];
+                    }
+                }
+            }
         },
 
         getShadowMeshes() {
@@ -155,10 +242,28 @@ function createPainterPlugin(type, Painter) {
             const meshKey = this._getMeshKey(context);
             const oldMeshes = this._getMesh(meshKey);
             if (oldMeshes) {
-                this.painter.deleteMesh(oldMeshes);
+                if (meshes && meshes.length) {
+                    // 瓦片数据刷新（缩放重解析等）时新 mesh 尚未加入场景，
+                    // 延迟到新 mesh 加入 scene 后的 endFrame 再 dispose 旧 mesh，
+                    // 避免本帧出现空白（旧数据继续显示直到新 mesh 就位）。
+                    if (!this._disposeQueue) {
+                        this._disposeQueue = [];
+                    }
+                    this._disposeQueue.push(oldMeshes);
+                } else {
+                    // 新 mesh 不可用，直接释放旧 mesh
+                    this.painter.deleteMesh(oldMeshes);
+                }
             }
             tileCache.meshes = meshes;
             this._meshCache[meshKey] = meshes;
+            if (this._frameCache) {
+                // 重新创建的 mesh 需要重新加入场景
+                delete this._frameCache[meshKey];
+            }
+            if (this._tileLevels) {
+                delete this._tileLevels[meshKey];
+            }
         },
 
         _createMeshes(geometries, context) {
@@ -231,21 +336,35 @@ function createPainterPlugin(type, Painter) {
             if (!meshes.length) {
                 return NO_REDRAW;
             }
+            if (this._paintedKeys) {
+                this._paintedKeys[key] = 1;
+            }
 
             //更新stencil level值，不同zoom会发生变化
+            // level 未变化时跳过 per-mesh 属性更新（跨帧复用 mesh 场景时，避免每帧对每个 mesh 写属性）
             const level = painter.getTileLevelValue(tileInfo, tileZoom);//getUniformLevel(tileInfo.z, tileZoom);
-            for (let i = 0, len = meshes.length; i < len; i++) {
-                const m = meshes[i];
-                // 保留一些有用的信息
-                m.properties.tile = tileInfo;
-                m.properties.level = level;
+            if (!this._tileLevels || this._tileLevels[key] !== level) {
+                if (!this._tileLevels) {
+                    this._tileLevels = {};
+                }
+                for (let i = 0, len = meshes.length; i < len; i++) {
+                    const m = meshes[i];
+                    // 保留一些有用的信息
+                    m.properties.tile = tileInfo;
+                    m.properties.level = level;
+                }
+                this._tileLevels[key] = level;
             }
 
             let redraw = false;
             if (!this._frameCache[key]) {
                 let progress = null;
                 let animation = sceneConfig.animation;
-                if (animation) {
+                const map = context.layer && context.layer.getMap && context.layer.getMap();
+                const isInteracting = map && map.isInteracting && map.isInteracting();
+                // 交互过程中优先保证缩放/平移流畅度，跳过 tile 的入场动画，
+                // 避免文字/图标在持续加载时反复申请 redraw。
+                if (animation && !isInteracting) {
                     const duration = context.sceneConfig.animationDuration || DEFAULT_ANIMATION_DURATION;
                     const t = (context.timestamp - meshes._animationTime) / duration;
                     const createTime = meshes[0].properties.createTime;
@@ -336,6 +455,7 @@ function createPainterPlugin(type, Painter) {
                 }
                 delete this._meshCache;
                 delete this._frameCache;
+                delete this._tileLevels;
             }
             return painter.updateSymbol(symbol, all);
         },
@@ -360,11 +480,16 @@ function createPainterPlugin(type, Painter) {
             if (this._frameCache) {
                 delete this._frameCache[key];
             }
+            if (this._tileLevels) {
+                delete this._tileLevels[key];
+            }
         },
 
         remove: function () {
             const painter = this.painter;
             if (painter && this._meshCache) {
+                // 先释放延迟 dispose 队列中的旧 mesh
+                this._flushDisposeQueue();
                 for (const key in this._meshCache) {
                     painter.deleteMesh(this._meshCache[key]);
                 }
@@ -373,6 +498,8 @@ function createPainterPlugin(type, Painter) {
             }
             delete this._meshCache;
             delete this._frameCache;
+            delete this._tileLevels;
+            delete this._disposeQueue;
         },
 
         resize: function (width, height) {

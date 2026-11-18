@@ -179,8 +179,12 @@ export default class Material extends Eventable(Base) {
     setFunctionUniform(k: string, fn: () => ShaderUniformValue): this {
       this._genUniformKeys();
       this._incrVersion();
+      if (Object.prototype.hasOwnProperty.call(this.uniforms, k)) {
+          delete this.uniforms[k];
+      }
       Object.defineProperty(this.uniforms, k, {
         enumerable: true,
+        configurable: true,
         get: fn
       });
       return this;

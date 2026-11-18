@@ -3,6 +3,7 @@ const assert = require('assert');
 const data = require('../integration/fixtures/data');
 const maptalks = require('maptalks');
 const startServer = require('./server.js');
+const { replaceTestPortDeep } = require('./server.js');
 const PORT = 4398;
 
 const mapRenderer = window.mapRenderer;
@@ -60,6 +61,7 @@ describe('picking specs', () => {
         map.on('click', e => {
             console.log(e.coordinate);
         });
+        replaceTestPortDeep(options);
         const layer = new GeoJSONVectorTileLayer('gvt', options);
         layer.once('canvasisdirty', () => {
             const result = layer.identify(coord);
@@ -1673,6 +1675,29 @@ describe('picking specs', () => {
         layer.addTo(map);
     }).timeout(5000);
 
+    [true, 'id', 'full'].forEach(featureMode => {
+        it(`should keep picking result available when options.features=${featureMode}`, done => {
+            map = new maptalks.Map(container, COMMON_OPTIONS.view || DEFAULT_VIEW);
+            const options = JSON.parse(JSON.stringify(COMMON_OPTIONS));
+            options.features = featureMode;
+            options.pickingPoint = true;
+            const layer = new GeoJSONVectorTileLayer('gvt', options);
+            layer.once('layerload', () => {
+                setTimeout(() => {
+                    const picked = layer.identify([0.5, 0.5]);
+                    assert.ok(picked.length > 0);
+                    assert.ok(picked[0].data);
+                    assert.ok(picked[0].data.feature);
+                    assert.strictEqual(picked[0].data.feature.type, 'Feature');
+                    assert.strictEqual(picked[0].data.feature.geometry.type, 'Point');
+                    assert.strictEqual(picked[0].data.feature.properties.type, 1);
+                    done();
+                }, 100);
+            });
+            layer.addTo(map);
+        }).timeout(7000);
+    });
+
     it('should pick nothing in VectorTileLayer', done => {
         map = new maptalks.Map(container, COMMON_OPTIONS.view || DEFAULT_VIEW);
         const options = JSON.parse(JSON.stringify(COMMON_OPTIONS));
@@ -1716,7 +1741,42 @@ describe('picking specs', () => {
         group.addTo(map);
     });
 
-    it('should return geographic coordinates in pick', done => {
+    it("should return geographic coordinates in pick when features='full'", done => {
+        map = new maptalks.Map(container, {
+            center: [0, 0],
+            zoom: 5,
+            devicePixelRatio: 1
+        });
+        const layer = new VectorTileLayer('vt', {
+            urlTemplate: 'http://localhost:4398/vt/{z}/{x}/{y}.mvt',
+            spatialReference: 'preset-vt-3857',
+            pickingGeometry: true,
+            features: 'full'
+        });
+        let count = 0;
+        layer.on('canvasisdirty', () => {
+            count++;
+            if (count === 5) {
+                const picked = layer.identifyAtPoint(new maptalks.Point(map.width / 2, map.height / 2));
+                const feature = picked[0].data.feature;
+                assert(feature.type === 'Feature');
+                let coordinates = feature.geometry.coordinates;
+                const type = feature.geometry.type;
+                assert(type.includes('Polygon'));
+                if (type === 'MultiPolygon') {
+                    coordinates = coordinates[0][0][0];
+                } else {
+                    coordinates = coordinates[0][0];
+                }
+                assert(Math.abs(coordinates[0]) < 10);
+                assert(Math.abs(coordinates[1]) < 10);
+                done();
+            }
+        });
+        layer.addTo(map);
+    });
+
+    it("should keep remote VectorTileLayer pick lightweight when features=true", done => {
         map = new maptalks.Map(container, {
             center: [0, 0],
             zoom: 5,
@@ -1733,8 +1793,64 @@ describe('picking specs', () => {
             count++;
             if (count === 5) {
                 const picked = layer.identifyAtPoint(new maptalks.Point(map.width / 2, map.height / 2));
+                assert(picked.length > 0);
                 const feature = picked[0].data.feature;
-                assert(feature.type === 'Feature');
+                assert(feature && typeof feature === 'object');
+                assert(!feature.geometry || !feature.geometry.type || !feature.geometry.coordinates);
+                done();
+            }
+        });
+        layer.addTo(map);
+    });
+
+    it("should treat features='id' as lightweight boundary in remote VectorTileLayer pick", done => {
+        map = new maptalks.Map(container, {
+            center: [0, 0],
+            zoom: 5,
+            devicePixelRatio: 1
+        });
+        const layer = new VectorTileLayer('vt', {
+            urlTemplate: 'http://localhost:4398/vt/{z}/{x}/{y}.mvt',
+            spatialReference: 'preset-vt-3857',
+            pickingGeometry: true,
+            features: 'id'
+        });
+        let count = 0;
+        layer.on('canvasisdirty', () => {
+            count++;
+            if (count === 5) {
+                const picked = layer.identifyAtPoint(new maptalks.Point(map.width / 2, map.height / 2));
+                assert(picked.length > 0);
+                const feature = picked[0].data.feature;
+                // 远程 VectorTileLayer 没有主线程原始 feature 集合可回填，
+                // id 模式只保证轻量标识，不保证返回完整 GeoJSON feature。
+                assert(!feature || typeof feature !== 'object' || !feature.geometry);
+                done();
+            }
+        });
+        layer.addTo(map);
+    });
+
+    it("should return full feature geometry when features='full' in remote VectorTileLayer pick", done => {
+        map = new maptalks.Map(container, {
+            center: [0, 0],
+            zoom: 5,
+            devicePixelRatio: 1
+        });
+        const layer = new VectorTileLayer('vt', {
+            urlTemplate: 'http://localhost:4398/vt/{z}/{x}/{y}.mvt',
+            spatialReference: 'preset-vt-3857',
+            pickingGeometry: true,
+            features: 'full'
+        });
+        let count = 0;
+        layer.on('canvasisdirty', () => {
+            count++;
+            if (count === 5) {
+                const picked = layer.identifyAtPoint(new maptalks.Point(map.width / 2, map.height / 2));
+                assert(picked.length > 0);
+                const feature = picked[0].data.feature;
+                assert(feature && feature.type === 'Feature');
                 let coordinates = feature.geometry.coordinates;
                 const type = feature.geometry.type;
                 assert(type.includes('Polygon'));

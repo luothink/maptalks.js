@@ -13,6 +13,8 @@ const karmaConfig = {
         'test/resources/ua-parser.min.js',
         //js for TileOffsetSpec.js
         'test/resources/chncrs.js',
+        //common test utilities, must be loaded before specs
+        'test/SpecCommon.js',
         'test/**/!(ClassSpec).js',
         {
             pattern: 'assets/css/**/*.css',

@@ -45,14 +45,16 @@ fn main(
     var vertexOutput: VertexOutput;
 
     var uv: vec2f = vertexInput.aTexCoord;
-
-    let encodedHeight: vec4f = textureSampleLevel(flatMask, flatMaskSampler, uv, 0.0);
     var altitude: f32 = vertexInput.aPosition.z;
 
+    #ifdef HAS_MASK_EXTENT
+    // 只有设置了 mask 时才需要逐顶点采样/解码 flatMask，无 mask 时跳过
+    let encodedHeight: vec4f = textureSampleLevel(flatMask, flatMaskSampler, uv, 0.0);
     if (length(encodedHeight) < 2.0) {
         let maskHeight: f32 = decodeFloat32(encodedHeight);
         altitude = min(vertexInput.aPosition.z, maskHeight);
     }
+    #endif
 
     var position: vec4f = vec4f(vertexInput.aPosition.xy, (altitude + uniforms.minAltitude), 1.0);
 

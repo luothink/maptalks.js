@@ -5,6 +5,7 @@ const { GeoJSONVectorTileLayer } = require('../../dist/maptalks.vt.js');
 const { GroupGLLayer } = require('@maptalks/gl');
 require('@maptalks/gpu');
 const startServer = require('./server.js');
+const { replaceTestPortDeep } = require('./server.js');
 const PORT = 4398;
 
 const mapRenderer = window.mapRenderer;
@@ -56,7 +57,10 @@ describe('update vt on terrain specs', () => {
         container.style.width = '512px';
         container.style.height = '512px';
         document.body.appendChild(container);
-        server = startServer(PORT, done);
+        server = startServer(PORT, () => {
+            replaceTestPortDeep(terrain);
+            done();
+        });
     });
 
     beforeEach(() => {
@@ -69,6 +73,86 @@ describe('update vt on terrain specs', () => {
 
     after(() => {
         server.close();
+    });
+
+    it('isolates terrain skin render context from the main pass', () => {
+        const layer = new GeoJSONVectorTileLayer('gvt', { data: line });
+        new GroupGLLayer('group', [layer]).addTo(map);
+        const renderer = layer.getRenderer();
+        const parent = renderer._parentContext;
+        try {
+            renderer._parentContext = {
+                renderTarget: { fbo: {} },
+                viewport: { width: 512, height: 512 },
+                terrainMaskFBO: {},
+                tile: {}
+            };
+            const skin = renderer._createTempRenderContext(1, true);
+            renderer._parentContext = { renderMode: 'default' };
+            const main = renderer._createTempRenderContext(1, true);
+            assert.notStrictEqual(main, skin);
+            for (const key of ['renderTarget', 'viewport', 'terrainMaskFBO', 'tile']) {
+                assert.strictEqual(main[key], undefined, `${key} leaked from terrain skin`);
+                assert(skin[key], `${key} was removed from the previous pass`);
+            }
+        } finally {
+            renderer._parentContext = parent;
+        }
+    });
+
+    it('keeps extrusion visible across repeated terrain toggles', async function () {
+        this.timeout(30000);
+        const fixture = require('../integration/fixtures/terrain/terrain-extrusion');
+        const layer = new GeoJSONVectorTileLayer('building_layer', {
+            data: fixture.data,
+            style: fixture.style,
+            tileLimitPerFrame: 0,
+            tileStackDepth: 0,
+            loadingLimit: 0,
+            fadeAnimation: false
+        });
+        const group = new GroupGLLayer('group', [layer]);
+        group.addTo(map);
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const waitForBuildings = (withTerrain, stage) => new Promise((resolve, reject) => {
+            const deadline = Date.now() + 6500;
+            const check = () => {
+                const renderer = layer.getRenderer();
+                const meshes = renderer._getAllPlugins().flatMap(plugin =>
+                    plugin.painter ? plugin.painter.scene.getMeshes() : []);
+                const ready = meshes.length && meshes.every(mesh =>
+                    !!mesh.defines.HAS_TERRAIN_ALTITUDE === withTerrain);
+                const source = map.getRenderer().canvas;
+                canvas.width = source.width;
+                canvas.height = source.height;
+                ctx.drawImage(source, 0, 0);
+                const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                let colored = 0;
+                for (let i = 0; i < pixels.length; i += 4) {
+                    if (pixels[i + 3] && (pixels[i] > pixels[i + 1] + 20 ||
+                        pixels[i + 1] > pixels[i] + 20)) {
+                        colored++;
+                    }
+                }
+                if (ready && colored > 10) {
+                    resolve();
+                } else if (Date.now() >= deadline) {
+                    reject(new Error(`${stage}: meshes=${meshes.length}, coloredPixels=${colored}, ready=${ready}`));
+                } else {
+                    group.getRenderer().setToRedraw();
+                    setTimeout(check, 80);
+                }
+            };
+            setTimeout(check, 300);
+        });
+        await waitForBuildings(false, 'initial');
+        group.setTerrain(terrain);
+        await waitForBuildings(true, 'terrain enabled');
+        group.setTerrain(null);
+        await waitForBuildings(false, 'terrain disabled');
+        group.setTerrain(terrain);
+        await waitForBuildings(true, 'terrain re-enabled');
     });
 
 

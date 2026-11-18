@@ -39,13 +39,24 @@ class FillPainter extends BasicPainter {
         return ['polygonBloom'];
     }
 
+    /**
+     * 预处理 symbol 中的颜色属性，确保 alpha 通道完整。
+     * 颜色值统一保持 0-1 范围（计算机图形学标准），不做 0-255 转换。
+     *
+     * 颜色最终走向两条渲染路径：
+     *   1. HAS_COLOR 顶点属性路径：packer 的 normalizeColor() 负责将颜色转为
+     *      0-255 存入 Uint8Array，shader 中通过 /255.0 复原为 0-1。
+     *   2. Uniform 路径：createColorSetter 通过 Color.unitArray() 保持 0-1，
+     *      shader 直接使用。
+     *
+     * 注意：此处如果做 *255 会导致 Uniform 路径拿到超出 0-1 的颜色值，
+     * 被 GPU 钳位后颜色严重失真（灰色变白色等）。
+     */
     prepareSymbol(symbol) {
+        // 确保 polygonFill 的 alpha 通道存在，默认为 1.0（完全不透明）
         const polygonFill = symbol.polygonFill;
-        if (Array.isArray(polygonFill)) {
-            if (polygonFill.length === 3) {
-                polygonFill.push(1);
-            }
-            symbol.polygonFill = polygonFill.map(c => c * 255);
+        if (Array.isArray(polygonFill) && polygonFill.length === 3) {
+            polygonFill.push(1);
         }
     }
 
@@ -85,7 +96,7 @@ class FillPainter extends BasicPainter {
         if (!this.isVisible()) {
             return EMPTY_ARRAY;
         }
-        const meshes = this.scene.getMeshes().filter(m => m.properties.level === 0);
+        const meshes = this.scene.getMeshes().filter(m => m && m.properties && m.properties.level === 0);
         return meshes;
     }
 
@@ -293,6 +304,9 @@ class FillPainter extends BasicPainter {
         }
 
         const { aPickingId, aPatternOrigin } = geo.data;
+        if (!aPickingId) {
+            return;
+        }
         const count = aPickingId.length;
         const aPatternWidth = new Float32Array(count * 2);
 
@@ -342,6 +356,9 @@ class FillPainter extends BasicPainter {
         const originFn = interpolated(symbolDef['polygonPatternFileOrigin']);
 
         const { aPickingId, aPatternOrigin } = geo.data;
+        if (!aPickingId) {
+            return;
+        }
         const count = aPickingId.length;
         const aPatternOffset = new Float32Array(count * 2);
 
@@ -391,6 +408,9 @@ class FillPainter extends BasicPainter {
         const map = this.getMap();
         const originFn = interpolated(symbolDef['polygonPatternFileOrigin']);
         const aPickingId = geo.data.aPickingId;
+        if (!aPickingId) {
+            return;
+        }
         const count = aPickingId.length;
         const aPatternOrigin = new Float32Array(count * 2);
         let current, currentOriginX, currentOriginY;

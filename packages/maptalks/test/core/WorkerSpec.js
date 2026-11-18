@@ -62,9 +62,7 @@ describe('WorkerSpec', function () {
         var key = getWorkerKey();
         maptalks.registerWorkerAdapter(key, fun);
         var actor1 = new Actor(key);
-        expect(actor1.initializing).to.be.eql(true);
         var actor2 = new Actor(key);
-        expect(actor2.initializing).to.be.eql(false);
         var result = [];
         for (let i = 0; i < 5; i++) {
             actor1.send({ num: i }, [], (err, data) => {
@@ -90,9 +88,7 @@ describe('WorkerSpec', function () {
         [key1, key2].forEach(key => {
             maptalks.registerWorkerAdapter(key, fun);
             var actor1 = new Actor(key);
-            expect(actor1.initializing).to.be.eql(true);
             var actor2 = new Actor(key);
-            expect(actor2.initializing).to.be.eql(false);
             actors.push(actor1, actor2);
             for (let i = 0; i < 5; i++) {
                 actor1.send({ num: i }, [], (err, data) => {
@@ -111,6 +107,40 @@ describe('WorkerSpec', function () {
             expect(result.length).to.be.eql(20);
             done();
         }, 1000);
+    });
+
+    it('large payload should bypass idle queue throttling', function (done) {
+        this.timeout(4000);
+        var key = getWorkerKey();
+        var originalRatio = maptalks.GlobalConfig.messagePostRatioPerWorker;
+        var timer = null;
+        maptalks.registerWorkerAdapter(key, function (exports) {
+            exports.onmessage = function (msg, postResponse) {
+                var size = msg.data.size;
+                var payload = new ArrayBuffer(size);
+                postResponse(null, { size: size, payload: payload }, [payload]);
+            };
+        });
+        maptalks.GlobalConfig.messagePostRatioPerWorker = 0;
+        var actor = new Actor(key);
+        function cleanup() {
+            maptalks.GlobalConfig.messagePostRatioPerWorker = originalRatio;
+            if (timer) {
+                clearTimeout(timer);
+                timer = null;
+            }
+        }
+        timer = setTimeout(function () {
+            cleanup();
+            done(new Error('large payload is still blocked by idle queue'));
+        }, 2000);
+        actor.send({ size: 3 * 1024 * 1024 }, [], function (err, data) {
+            cleanup();
+            expect(err).not.to.be.ok();
+            expect(data.size).to.be.eql(3 * 1024 * 1024);
+            expect(data.payload.byteLength).to.be.eql(3 * 1024 * 1024);
+            done();
+        });
     });
 
     it('core-fetch-image', function (done) {

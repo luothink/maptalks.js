@@ -12,10 +12,25 @@
     varying float vHeightRatio;
     varying float vHeightOffset;
 
-    const float CLIPINSIDE_MODE = 0.2;
-    const float FLATINSIDE_MODE = 0.3;
-    const float FLATOUTSIDE_MODE = 0.4;
-    const float ELEVATE_MODE = 0.7;
+    // =====================================================================
+    // 【掩膜模式量化误差说明——修改边界常量前必读】详细背景见 mask.frag 顶部注释。
+    //
+    // 模式值（Mask.js 的 MASK_MODES：0.1~0.7）经 maskModeExtent.frag 写入
+    // RGBA8（8bit）纹理后存在量化误差：其中 0.1 / 0.3 / 0.7 × 255 = 25.5 / 76.5 / 178.5
+    // 为进位临界值，不同 GPU 舍入方向不同（Windows 多向下舍入、Mac Metal 向上舍入），
+    // 读回值会偏离写入值 ±1/255。
+    //
+    // 历史 bug：修复前边界常量直接取模式值本身（如 CLIPINSIDE_MODE = 0.2），
+    // 精确比较在舍入方向不同的 GPU 上行为不一致，
+    // 曾导致 flat-inside（压平）、elevate（抬升）在 Mac 上静默失效。
+    //
+    // 修复方案：边界常量取相邻模式值的中点（±0.05），远大于 1LSB 误差（0.5/255 ≈ 0.002），
+    // 对任何 GPU 的舍入方向都免疫。JS 侧 MASK_MODES 的写入值保持不变。
+    // =====================================================================
+    const float CLIPINSIDE_MODE = 0.25;  // clip-outside(0.2) 与 flat-inside(0.3) 的中点
+    const float FLATINSIDE_MODE = 0.35;  // flat-inside(0.3) 与 flat-outside(0.4) 的中点
+    const float FLATOUTSIDE_MODE = 0.45; // flat-outside(0.4) 与 color(0.5) 的中点
+    const float ELEVATE_MODE = 0.75;     // elevate(0.7) 的上界中点
 
     float random (vec2 st) {
         return fract(sin(dot(st.xy,vec2(12.9898,78.233)))*43758.5453123) * 0.1;
@@ -26,7 +41,8 @@
     }
 
     float getFlatHeight(float maskMode, float flatHeight, float height) {
-      if (maskMode <= ELEVATE_MODE && maskMode > 0.6) {
+      // 0.65 为 texture/video(0.6) 与 elevate(0.7) 的中点，容忍 8bit 纹理量化误差（详见顶部注释）
+      if (maskMode <= ELEVATE_MODE && maskMode > 0.65) {
           return flatHeight + height;
       } else {
         return flatHeight;
@@ -67,7 +83,8 @@
         }
         if (isInExtent(extentColor) == true && maskMode <= FLATINSIDE_MODE && maskMode > CLIPINSIDE_MODE) {
             return getNoErrorPosition(position, wPosition);
-        } if (isInExtent(extentColor) == true && maskMode <= ELEVATE_MODE && maskMode > 0.6) {
+        } if (isInExtent(extentColor) == true && maskMode <= ELEVATE_MODE && maskMode > 0.65) {
+            // elevate 分支：下界 0.65 为 texture/video(0.6) 与 elevate(0.7) 的中点（详见顶部注释）
             return getNoErrorPosition(position, wPosition);
         } else {
             return modelViewMatrix * position;

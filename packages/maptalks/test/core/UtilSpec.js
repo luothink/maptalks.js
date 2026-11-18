@@ -97,6 +97,21 @@ describe('Util', function () {
         expect(maptalks.Util.getSymbolHash(symbol)).to.be.eql(expected);
     });
 
+    it('LRUCache should evict immediately when size exceeds max', function () {
+        var removed = [];
+        var cache = new maptalks.LRUCache(2, function (item) {
+            removed.push(item);
+        });
+        cache.add('a', 1);
+        cache.add('b', 2);
+        cache.add('c', 3);
+        expect(cache.keys()).to.be.eql(['b', 'c']);
+        expect(cache.get('a')).to.be.eql(null);
+        expect(cache.get('b')).to.be.eql(2);
+        expect(cache.get('c')).to.be.eql(3);
+        expect(removed).to.be.eql([1]);
+    });
+
     describe('split content', function () {
         var style = {
             'textFaceName': 'sans-serif',

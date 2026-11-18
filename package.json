@@ -11,6 +11,7 @@
     "build": "turbo run build --filter=maptalks-gl --filter=maptalks-gpu --filter=@maptalks/analysis",
     "build-all": "turbo run build",
     "build-dev": "turbo run build-dev*",
+    "gen-shadow": "node scripts/generate-shadow-packages.js",
     "lint": "turbo run lint",
     "prettier": "prettier --parser=typescript --write **/*.{js,ts,md}",
     "maptalks-test": "pnpm --filter=maptalks run test",

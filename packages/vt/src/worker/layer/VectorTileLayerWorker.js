@@ -1,17 +1,52 @@
-import LayerWorker from './BaseLayerWorker';
-import pbf from 'pbf';
-import { VectorTile } from '@mapbox/vector-tile';
-import Ajax from '../util/Ajax';
-import { isNil, hasOwn, isString } from '../../common/Util';
-import { PROP_OMBB } from '../../common/Constant';
-import { projectOMBB } from '../builder/Ombb.js';
-import { calArrayBufferSize, isNumber, arraybufferIsGZip, decompressGzipWithBlob } from '../util/index';
+import LayerWorker from "./BaseLayerWorker";
+import pbf from "pbf";
+import { VectorTile } from "@mapbox/vector-tile";
+import Ajax from "../util/Ajax";
+import { isNil, hasOwn, isString } from "../../common/Util";
+import { PROP_OMBB } from "../../common/Constant";
+import { projectOMBB } from "../builder/Ombb.js";
+import {
+    calArrayBufferSize,
+    isNumber,
+    arraybufferIsGZip,
+    decompressGzipWithBlob
+} from "../util/index";
 
 const ALTITUDE_ERRORS = {
-    'MISSING_ALTITUDE_ELEMENT': 2,
+    MISSING_ALTITUDE_ELEMENT: 2
 };
 
-const textDecode = new TextDecoder('utf-8');
+const textDecode = new TextDecoder("utf-8");
+const DEFAULT_LOAD_TILE_CACHE_MAX_SIZE = 2;
+
+function getLoadTileCacheMaxSize(context) {
+    const { loadTileCachMaxSize } = context;
+    if (isNumber(loadTileCachMaxSize) && loadTileCachMaxSize > 0) {
+        return loadTileCachMaxSize;
+    }
+    return DEFAULT_LOAD_TILE_CACHE_MAX_SIZE;
+}
+
+function shouldCacheTile(arrayBuffer, context, url) {
+    if (!arrayBuffer) {
+        return false;
+    }
+    const { loadTileCacheLog } = context;
+    const maxSize = getLoadTileCacheMaxSize(context);
+    const bufferSize = calArrayBufferSize(arrayBuffer);
+    // worker cache 默认只保留较小的 tile 原始数据。
+    // 对大 buffer 而言，缓存命中带来的收益往往小于长期驻留的内存成本，
+    // 尤其在持续平移/缩放场景下更容易把 worker 推向高内存稳定态。
+    if (bufferSize > maxSize) {
+        if (loadTileCacheLog) {
+            console.warn(
+                `url:${url},loadTileCachMaxSize exceeded: ${bufferSize} > ${maxSize},the tile will not be cached.`
+            );
+        }
+        return false;
+    }
+    return true;
+}
 
 export default class VectorTileLayerWorker extends LayerWorker {
     constructor(id, options, uploader, cache, loadings, callback) {
@@ -35,10 +70,23 @@ export default class VectorTileLayerWorker extends LayerWorker {
         const { altitudePropertyName, disableAltitudeWarning } = context;
 
         const doReadTile = (err, data) => {
-            this._getStyleByCounter(context.styleCounter).then(compiledStyle => {
-                const layerFilter = this._getLayerFilter(context.styleCounter, compiledStyle.style);
-                this._readTile(url, altitudePropertyName, disableAltitudeWarning, err, data, cb, layerFilter);
-            });
+            this._getStyleByCounter(context.styleCounter).then(
+                (compiledStyle) => {
+                    const layerFilter = this._getLayerFilter(
+                        context.styleCounter,
+                        compiledStyle.style
+                    );
+                    this._readTile(
+                        url,
+                        altitudePropertyName,
+                        disableAltitudeWarning,
+                        err,
+                        data,
+                        cb,
+                        layerFilter
+                    );
+                }
+            );
         };
 
         const cached = this._cache.get(url);
@@ -58,14 +106,13 @@ export default class VectorTileLayerWorker extends LayerWorker {
         }
         fetchOptions.referrer = context.referrer;
         fetchOptions.errorLog = context.loadTileErrorLog;
-        const { loadTileCachMaxSize, loadTileCacheLog } = context;
-
         return Ajax.getArrayBuffer(url, fetchOptions, (err, response) => {
             if (!this._cache) {
                 // removed
                 return;
             }
-            let arrayBuffer, hasData = false;
+            let arrayBuffer,
+                hasData = false;
 
             const readTile = () => {
                 doReadTile(err, arrayBuffer);
@@ -73,7 +120,11 @@ export default class VectorTileLayerWorker extends LayerWorker {
 
             if (err) {
                 if (!err.loading) {
-                    this._cache.add(url, { err, data: response && response.data, cacheIndex: context.workerCacheIndex });
+                    this._cache.add(url, {
+                        err,
+                        data: response && response.data,
+                        cacheIndex: context.workerCacheIndex
+                    });
                 }
             } else if (response && response.data) {
                 hasData = true;
@@ -81,29 +132,23 @@ export default class VectorTileLayerWorker extends LayerWorker {
                 const isGZip = arraybufferIsGZip(arrayBuffer);
 
                 const resolveTile = () => {
-                    let needCache = true;
-                    if (arrayBuffer && isNumber(loadTileCachMaxSize) && loadTileCachMaxSize > 0) {
-                        const bufferSize = calArrayBufferSize(arrayBuffer);
-                        if (bufferSize > loadTileCachMaxSize) {
-                            needCache = false;
-                            if (loadTileCacheLog) {
-                                console.warn(`url:${url},loadTileCachMaxSize exceeded: ${bufferSize} > ${loadTileCachMaxSize},the tile will not be cached.`);
-                            }
-                        }
-                    }
-                    if (needCache && arrayBuffer) {
-                        this._cache.add(url, { err: null, data: arrayBuffer, cacheIndex: context.workerCacheIndex });
+                    if (shouldCacheTile(arrayBuffer, context, url)) {
+                        this._cache.add(url, {
+                            err: null,
+                            data: arrayBuffer,
+                            cacheIndex: context.workerCacheIndex
+                        });
                     }
                     readTile();
                 };
 
                 if (isGZip) {
-                    decompressGzipWithBlob(arrayBuffer, (buffer => {
+                    decompressGzipWithBlob(arrayBuffer, (buffer) => {
                         if (buffer) {
                             arrayBuffer = buffer;
                         }
                         resolveTile();
-                    }))
+                    });
                 } else {
                     resolveTile();
                 }
@@ -114,7 +159,15 @@ export default class VectorTileLayerWorker extends LayerWorker {
         });
     }
 
-    _readTile(url, altitudePropertyName, disableAltitudeWarning, err, data, cb, layerFilter) {
+    _readTile(
+        url,
+        altitudePropertyName,
+        disableAltitudeWarning,
+        err,
+        data,
+        cb,
+        layerFilter
+    ) {
         if (err) {
             cb(err);
             return;
@@ -124,7 +177,7 @@ export default class VectorTileLayerWorker extends LayerWorker {
             tile = new VectorTile(new pbf(data));
         } catch (err) {
             const content = textDecode.decode(data);
-            err.message += '\n' + url + '\n' + content;
+            err.message += "\n" + url + "\n" + content;
             cb(err.message, [], []);
             return;
         }
@@ -159,7 +212,7 @@ export default class VectorTileLayerWorker extends LayerWorker {
                             properties: f.properties,
                             extent: f.extent
                         };
-                        Object.defineProperty(fea, 'geometry', {
+                        Object.defineProperty(fea, "geometry", {
                             get: function () {
                                 if (!this._geometry) {
                                     this._geometry = f.loadGeometry();
@@ -178,8 +231,13 @@ export default class VectorTileLayerWorker extends LayerWorker {
                             Object.defineProperty(fea.properties, PROP_OMBB, {
                                 get: function () {
                                     if (!this._ombb_projected) {
-                                        const parsed = isString(ombb) ? JSON.parse(ombb) : ombb;
-                                        this._ombb_projected = projectOMBB(parsed, 'EPSG:3857');
+                                        const parsed = isString(ombb)
+                                            ? JSON.parse(ombb)
+                                            : ombb;
+                                        this._ombb_projected = projectOMBB(
+                                            parsed,
+                                            "EPSG:3857"
+                                        );
                                     }
                                     return this._ombb_projected;
                                 },
@@ -187,27 +245,30 @@ export default class VectorTileLayerWorker extends LayerWorker {
                                 configurable: true
                             });
                         }
-                        const altitudeBase64 = altitudePropertyName && fea.properties[altitudePropertyName];
+                        const altitudeBase64 =
+                            altitudePropertyName &&
+                            fea.properties[altitudePropertyName];
                         if (altitudeBase64) {
                             const altitudes = decodeAltitude(altitudeBase64);
                             const errors = [];
                             fillAltitude(fea.geometry, altitudes, errors);
                             if (errors.length && !disableAltitudeWarning) {
-                                console.warn('feature.geometry is not consistent with altitude values:');
+                                console.warn(
+                                    "feature.geometry is not consistent with altitude values:"
+                                );
                                 console.warn(JSON.stringify(fea, null, 2));
                             }
                         }
                         features.push(fea);
                     } catch (err) {
-                        console.warn('error when load vt geometry:', err);
+                        console.warn("error when load vt geometry:", err);
                     }
-
                 }
             }
         }
 
         for (const p in layers) {
-            layers[p].types = Object.keys(layers[p].types).map(t => +t);
+            layers[p].types = Object.keys(layers[p].types).map((t) => +t);
         }
 
         cb(null, features, layers, { byteLength: data.byteLength });
@@ -259,7 +320,7 @@ function fillAltitude(geometry, altitudes, errors, iterator) {
         } else {
             const index = iterator.index;
             if (isNil(altitudes[index])) {
-                errors.push(ALTITUDE_ERRORS['MISSING_ALTITUDE_ELEMENT'])
+                errors.push(ALTITUDE_ERRORS["MISSING_ALTITUDE_ELEMENT"]);
             } else {
                 // meter to centimeter, reason refers to convert.js
                 geometry[i].z = altitudes[index] * 100;

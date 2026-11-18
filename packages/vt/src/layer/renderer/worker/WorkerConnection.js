@@ -213,6 +213,36 @@ export default class WorkerConnection extends maptalks.worker.Actor {
         this.send(data, null, cb, this._dedicatedVTWorkers[layerId]);
     }
 
+    /**
+     * Lazily fetch feature properties for features:'id' mode.
+     * Must use the same worker as loadTile to find the stored properties.
+     * @param {string} tileKey - the tile key used by the worker's property store
+     * @param {string[]} featureIds - array of feature IDs to look up
+     * @param {number} workerX - tile x coordinate (for worker selection hash)
+     * @param {number} workerY - tile y coordinate (for worker selection hash)
+     * @param {Function} cb - (err, propsById)
+     */
+    getFeatureProperties(tileKey, featureIds, workerX, workerY, cb) {
+        const layerId = this._workerLayerId;
+        const data = {
+            mapId: this._mapId,
+            layerId,
+            command: 'getFeatureProperties',
+            params: {
+                tileKey,
+                featureIds
+            }
+        };
+        const dedicatedWorkerId = this._dedicatedVTWorkers[layerId];
+        if (this._isDedicated && dedicatedWorkerId !== undefined) {
+            this.send(data, null, cb, dedicatedWorkerId);
+        } else {
+            // Must use the same scheduling hash as loadTile: (x + y) % length.
+            const s = (workerX + workerY) % this.workers.length;
+            this.send(data, null, cb, this.workers[s].id);
+        }
+    }
+
     _getTileKey(tileInfo) {
         return tileInfo.id;
     }

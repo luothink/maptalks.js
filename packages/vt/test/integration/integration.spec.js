@@ -8,6 +8,7 @@ const { GroupGLLayer } = require('@maptalks/gl');
 require('@maptalks/gpu');
 const { GeoJSONVectorTileLayer, VectorTileLayer } = require('../../dist/maptalks.vt.js');
 const startServer = require('../specs/server.js');
+const { replaceTestPortDeep } = require('../specs/server.js');
 const PORT = 4398;
 
 const GENERATE_MODE = false; //(process.env.BUILD || remote.getGlobal('process').env.BUILD) === 'fixtures';
@@ -95,6 +96,7 @@ describe('vector tile integration specs', () => {
                 style.workerGlyph = false;
             }
             // style.debug = true;
+            replaceTestPortDeep(style);
             const ctor = style.isVectorTile ? VectorTileLayer : GeoJSONVectorTileLayer;
             const layer = new ctor('gvt', style);
             let generated = false;
@@ -185,6 +187,7 @@ describe('vector tile integration specs', () => {
             style.tileStackDepth = 0;
             style.loadingLimit = 0;
             // style.debug = true;
+            replaceTestPortDeep(style);
             const layer = new GeoJSONVectorTileLayer('gvt', style);
             const sceneConfig = style.sceneConfig;
             const groupLayer = new GroupGLLayer('group', [layer], { sceneConfig, antialias: false });

@@ -6,6 +6,7 @@ const { GeoJSONVectorTileLayer } = require('../../dist/maptalks.vt.js');
 const { GroupGLLayer } = require('@maptalks/gl');
 require('@maptalks/gpu');
 const startServer = require('../specs/server.js');
+const { replaceTestPortDeep } = require('../specs/server.js');
 const PORT = 4398;
 
 const DEFAULT_VIEW = {
@@ -75,13 +76,14 @@ describe('vector tile on terrain integration specs', () => {
             style.tileStackDepth = 0;
             style.fadeAnimation = false;
             // style.debug = true;
+            replaceTestPortDeep(style);
             const sceneConfig = style.sceneConfig || {};
             const layer = new GeoJSONVectorTileLayer('gvt', style);
             const terrain = {
                 type: 'mapbox',
                 tileSize: 512,
                 spatialReference: 'preset-vt-3857',
-                urlTemplate: 'http://localhost:' + PORT + '/mapbox-terrain/{z}/{x}/{y}.webp',
+                urlTemplate: 'http://localhost:' + (server && server.port || PORT) + '/mapbox-terrain/{z}/{x}/{y}.webp',
                 tileStackDepth: 0,
                 tileLimitPerFrame: 0,
                 loadingLimit: 0,

@@ -52,6 +52,10 @@ class Painter {
         this.levelNFilter = levelNFilter;
         this.loginTextureCache();
         this.symbolDef = Array.isArray(symbol) ? symbol.map(s => copyJSON(s)) : [copyJSON(symbol)];
+        // 内置 MapLibre expression 解析：将 style 中的 MapLibre expression 数组
+        // （如 ["step", ["get", "caliber"], ...]）转换为 maptalks function-type 对象，
+        // 使 lineColor/lineWidth 等属性可按要素属性逐要素求值
+        this.symbolDef = this.symbolDef.map(s => s ? StyleUtil.convertExpressionInSymbol(s) : s);
         this._compileSymbols();
         this.pickingViewport = {
             x: 0,
@@ -394,8 +398,30 @@ class Painter {
         // }
         const isRenderingTerrainVector = context.isRenderingTerrain && this.isTerrainVector();
         const fbo = this.getRenderFBO(context);
-        meshes = meshes.filter(m => this.isMeshVisible(m));
+        // 内联可见性过滤：全部可见时复用原数组，避免 filter 数组分配
+        let visibleMeshes = meshes;
+        for (let i = 0, len = meshes.length; i < len; i++) {
+            if (!this.isMeshVisible(meshes[i])) {
+                visibleMeshes = [];
+                for (let j = 0; j < len; j++) {
+                    if (this.isMeshVisible(meshes[j])) {
+                        visibleMeshes.push(meshes[j]);
+                    }
+                }
+                break;
+            }
+        }
+        meshes = visibleMeshes;
         if (isRenderingTerrainVector) {
+            for (let i = 0, len = meshes.length; i < len; i++) {
+                const m = meshes[i];
+                if (m.geometry && !m.geometry.data.aTerrainAltitude) {
+                    const geo = m.geometry;
+                    this._updateTerrainAltitude(geo, geo.data, geo.properties, geo.desc && geo.desc.positionSize || 3, context);
+                } else if ((m instanceof reshader.InstancedMesh) && m.instancedData && !m.instancedData.aTerrainAltitude) {
+                    this._updateTerrainAltitude(m, m.instancedData, m.properties, 3, context);
+                }
+            }
             // 只绘制加载了地形数据的mesh
             meshes = meshes.filter(m => m.geometry && m.geometry.data.aTerrainAltitude || (m instanceof reshader.InstancedMesh) && m.instancedData.aTerrainAltitude);
         }
@@ -436,14 +462,17 @@ class Painter {
             if (!fbo) {
                 if (mesh.uniforms['targetFramebuffer']) {
                     mesh.uniforms['targetFramebuffer'] = null;
+                    mesh.properties._lastTargetFbo = null;
                 }
-            } else {
+            } else if (mesh.properties._lastTargetFbo !== fbo) {
+                mesh.properties._lastTargetFbo = fbo;
                 mesh.setUniform('targetFramebuffer', fbo);
             }
             this._highlightMesh(mesh);
         }
 
         this.scene.addMesh(meshes);
+        this._meshesDirty = true;
         return;
     }
 
@@ -462,6 +491,9 @@ class Painter {
     }
 
     prepareRender(context) {
+        // 渲染前先清理被 LRU 淘汰/瓦片数据刷新 dispose 后残留的 mesh（properties 被置为 null），
+        // 避免其进入 prepareRender / callShader 的遍历与排序（TextPainter 等会访问 properties.*）
+        this._pruneDisposedMeshes(context && context.timestamp);
         if (this._currentTimestamp === context.timestamp) {
             return;
         }
@@ -476,9 +508,22 @@ class Painter {
         const map = this.getMap();
         const cache = maptalks.MapStateCache[map.id];
         const z = cache ? cache.zoom : map.getZoom();
+        const highlightChanged = this._highlightTimestamp !== this._lastHighlightTimestamp;
+        // mesh 未变化、zoom 未变化且 highlight 未变化时，无需重新更新 fn-type 属性与高亮
+        if (!this._meshesDirty && !highlightChanged && this._lastPrepareZoom === z) {
+            return;
+        }
+        this._lastPrepareZoom = z;
+        if (highlightChanged) {
+            this._lastHighlightTimestamp = this._highlightTimestamp;
+        }
         for (let i = 0; i < meshes.length; i++) {
             if (!meshes[i] || !meshes[i].geometry) {
                 continue;
+            }
+            // mesh 跨帧持久保留，highlight 变化时在此重新应用高亮（原逻辑依赖每帧 addMesh）
+            if (highlightChanged) {
+                this._highlightMesh(meshes[i]);
             }
             if (sceneFilter && !sceneFilter(meshes[i])) {
                 continue;
@@ -525,9 +570,73 @@ class Painter {
         this._redraw = true;
     }
 
+    // 清理被 LRU 淘汰/瓦片数据刷新 dispose 后残留的 mesh（properties 被置为 null）。
+    // prepareRender 与 callShader 等多个入口共用，同一帧仅执行一次。
+    _pruneDisposedMeshes(timestamp) {
+        if (this._prunedTimestamp === timestamp) {
+            return;
+        }
+        this._prunedTimestamp = timestamp;
+        const sceneMeshes = this.scene.getMeshes();
+        if (!sceneMeshes || !sceneMeshes.length) {
+            return;
+        }
+        let hasDisposed = false;
+        for (let i = 0; i < sceneMeshes.length; i++) {
+            if (!sceneMeshes[i] || !sceneMeshes[i].properties) {
+                hasDisposed = true;
+                break;
+            }
+        }
+        if (hasDisposed) {
+            const validMeshes = [];
+            for (let i = 0; i < sceneMeshes.length; i++) {
+                if (sceneMeshes[i] && sceneMeshes[i].properties) {
+                    validMeshes.push(sceneMeshes[i]);
+                }
+            }
+            this.scene.setMeshes(validMeshes);
+        }
+    }
+
     callShader(uniforms, context) {
-        this.callCurrentTileShader(uniforms, context);
-        this.callBackgroundTileShader(uniforms, context);
+        // mesh 集合未变化时跳过全量排序（新增/删除 mesh 时会重新排序）。
+        // 排序前先清理被 LRU 淘汰/数据刷新 dispose 后残留的 mesh（properties 被置为 null），
+        // 避免其进入 current/background 两个阶段的排序与渲染。
+        if (this._meshesDirty) {
+            this._meshesDirty = false;
+            this._pruneDisposedMeshes(context && context.timestamp);
+            this.scene.getMeshes().sort(sortByLevel);
+        }
+        // tile fading 机制：
+        // 当前瓦片按正常 opacity 渲染，背景瓦片(zoom 过渡中的父/子级瓦片) 降低不透明度。
+        // 注意：_setLayerUniforms 在 callRenderer 中会重置 layerOpacity，
+        // 所以不能在这里直接修改 uniforms.layerOpacity，需要通过 _bgOpacityFactor
+        // 在 callRenderer 中 _setLayerUniforms 之后应用。
+        // 排序后 level===0（当前瓦片）在前、level>0（背景瓦片）在后，
+        // 依据首尾 mesh 的 level 快速判断各阶段是否存在可渲染 mesh，
+        // 稳定状态（无背景瓦片）时跳过 background 阶段，避免一次无谓的完整空渲染。
+        const meshes = this.scene.getMeshes();
+        const len = meshes.length;
+        if (len === 0) {
+            return;
+        }
+        const firstMesh = meshes[0];
+        const lastMesh = meshes[len - 1];
+        const firstLevel = firstMesh && firstMesh.properties ? firstMesh.properties.level : 0;
+        const lastLevel = lastMesh && lastMesh.properties ? lastMesh.properties.level : 0;
+        this._bgOpacityFactor = 1.0;
+        if (firstLevel === 0) {
+            this.callCurrentTileShader(uniforms, context);
+        }
+
+        const renderer = this.layer.getRenderer();
+        const bgOpacity = renderer._lastBackgroundTileOpacity;
+        this._bgOpacityFactor = (bgOpacity !== undefined && bgOpacity < 1) ? bgOpacity : 1.0;
+        if (lastLevel > 0) {
+            this.callBackgroundTileShader(uniforms, context);
+        }
+        this._bgOpacityFactor = 1.0;
     }
 
     callCurrentTileShader(uniforms, context) {
@@ -544,28 +653,49 @@ class Painter {
             //stenciled pixels already rendered in step 1
             this.shader.filter = context && context.sceneFilter ? [this.levelNFilter, context.sceneFilter] : this.levelNFilter;
         }
-        this.scene.getMeshes().sort(sortByLevel);
         this.callRenderer(this.shader, uniforms, context);
     }
 
     callRenderer(shader, uniforms, context) {
         const meshes = this.scene.getMeshes();
-        const renderMeshes = [];
+        const renderMeshes = this._getBloomRenderMeshes(meshes, context);
+        this._setLayerUniforms(uniforms);
+        // tile fading：背景瓦片的 GL 不透明度降低
+        // _bgOpacityFactor 由 callShader 在渲染背景瓦片前设置
+        if (this._bgOpacityFactor !== undefined && this._bgOpacityFactor < 1) {
+            uniforms.layerOpacity *= this._bgOpacityFactor;
+        }
+        uniforms.painterContext = context;
+        if (renderMeshes !== meshes) {
+            this.scene.setMeshes(renderMeshes);
+            this._drawCount += this.renderer.render(shader, uniforms, this.scene, this.getRenderFBO(context));
+            this.scene.setMeshes(meshes);
+        } else {
+            this._drawCount += this.renderer.render(shader, uniforms, this.scene, this.getRenderFBO(context));
+        }
+    }
+
+    // 无 bloom 高亮 mesh 时，直接复用 scene 中的 mesh 数组，
+    // 避免每帧构建 renderMeshes 临时数组并调用两次 setMeshes 重建数组
+    _getBloomRenderMeshes(meshes, context) {
+        if (!(context && context.bloom)) {
+            return meshes;
+        }
+        let renderMeshes = null;
         for (let i = 0, len = meshes.length; i < len; i++) {
             const mesh = meshes[i];
-
-            if (mesh.properties.hlBloomMesh && context && context.bloom) {
+            if (mesh && mesh.properties && mesh.properties.hlBloomMesh) {
+                if (!renderMeshes) {
+                    renderMeshes = [];
+                }
                 renderMeshes.push(mesh.properties.hlBloomMesh);
             }
-            renderMeshes.push(mesh);
+            // 过滤已 dispose 的 mesh，避免其进入渲染
+            if (renderMeshes && mesh && mesh.properties) {
+                renderMeshes.push(mesh);
+            }
         }
-
-        this._setLayerUniforms(uniforms);
-
-        this.scene.setMeshes(renderMeshes);
-        uniforms.painterContext = context;
-        this._drawCount += this.renderer.render(shader, uniforms, this.scene, this.getRenderFBO(context));
-        this.scene.setMeshes(meshes);
+        return renderMeshes || meshes;
     }
 
     _setLayerUniforms(uniforms) {
@@ -711,6 +841,7 @@ class Painter {
         if (!meshes) {
             return;
         }
+        this._meshesDirty = true;
         this.scene.removeMesh(meshes);
         if (Array.isArray(meshes)) {
             for (let i = 0; i < meshes.length; i++) {
@@ -724,8 +855,8 @@ class Painter {
                 if (meshes[i].material) {
                     meshes[i].material.dispose();
                 }
-                meshes[i].dispose();
                 HighlightUtil.deleteHighlightBloomMesh(meshes[i]);
+                meshes[i].dispose();
             }
         } else {
             if (!meshes.isValid()) {
@@ -737,12 +868,20 @@ class Painter {
             if (meshes.material) {
                 meshes.material.dispose();
             }
-            meshes.dispose();
             HighlightUtil.deleteHighlightBloomMesh(meshes);
+            meshes.dispose();
         }
     }
 
-    startFrame(context) {
+    // 仅将 mesh 从 scene 中移除（保留 mesh/geometry 缓存，tile 重新进入视口时可复用）
+    removeMeshFromScene(meshes) {
+        if (!meshes) {
+            return;
+        }
+        this.scene.removeMesh(meshes);
+    }
+
+    startFrame(context, keepMeshes) {
         if (!this._inited) {
             this.init(context);
             this._inited = true;
@@ -752,7 +891,12 @@ class Painter {
             this._needRetire = false;
             this._drawCount = 0;
         }
-        this.scene.clear();
+        if (this._meshesDirty === undefined) {
+            this._meshesDirty = true;
+        }
+        if (!keepMeshes) {
+            this.scene.clear();
+        }
     }
 
     resize(/*width, height*/) { }
@@ -826,7 +970,7 @@ class Painter {
             this._invisibleWhenCreated[i] = false;
             return true;
         }
-        this.symbolDef[i] = copyJSON(all);
+        this.symbolDef[i] = StyleUtil.convertExpressionInSymbol(copyJSON(all));
         const symbol = this._symbol[i];
         for (const p in symbol) {
             delete symbol[p];
@@ -1272,11 +1416,23 @@ class Painter {
 
     _highlightMesh(mesh) {
         // ignore halo text meshes, maptalks/issues#562
-        if (mesh && mesh.properties.isHalo) {
+        if (mesh && mesh.properties && mesh.properties.isHalo) {
             return;
         }
         const properties = mesh instanceof reshader.InstancedMesh ? mesh.properties : mesh.geometry.properties;
+        if (!properties) {
+            return;
+        }
         const { pickingIdIndiceMap } = properties;
+        // 无 pickingIdIndiceMap 的 mesh（如无 feature 绑定数据的 mesh）不支持高亮
+        if (!pickingIdIndiceMap) {
+            return;
+        }
+        // 高亮数据未发生变化时跳过，避免每帧转换 highlights 的开销
+        // highlightMesh 内部会将 _highlightTimestamp 写入 mesh.properties.highlightTimestamp
+        if (mesh.properties.highlightTimestamp === this._highlightTimestamp) {
+            return;
+        }
         const highlights = this._highlighted ? convertHighlights(mesh, this.layer, this._highlighted) : null;
         HighlightUtil.highlightMesh(this.regl, mesh, highlights, this._highlightTimestamp, pickingIdIndiceMap);
     }
@@ -1453,7 +1609,15 @@ class Painter {
 
     appendWGSLPositionType(mesh, defines) {
         const positionAttr = mesh.geometry.desc.positionAttribute;
-        const isFloat32 = mesh.geometry.data[positionAttr].array instanceof Float32Array;
+        const posData = mesh.geometry.data[positionAttr];
+        if (!posData || !posData.array) {
+            // geometry.data[positionAttr] may be undefined after _prepareData
+            // restructures data form, or after dispose. Default to float32.
+            defines['POSITION_TYPE_2'] = 'vec2f';
+            defines['POSITION_TYPE_3'] = 'vec3f';
+            return;
+        }
+        const isFloat32 = posData.array instanceof Float32Array;
         defines['POSITION_TYPE_2'] = isFloat32 ? 'vec2f' : 'vec2i';
         defines['POSITION_TYPE_3'] = isFloat32 ? 'vec3f' : 'vec4i';
         if (!isFloat32) {
@@ -1473,6 +1637,11 @@ function sortByCommandKey(a, b) {
 
 
 function sortByLevel(m0, m1) {
+    // 防御：tile 被 LRU 淘汰或数据刷新时 mesh 可能已 dispose（properties 被置 null），
+    // 排序比较时跳过，避免访问 null 崩溃
+    if (!m0 || !m0.properties || !m1 || !m1.properties) {
+        return 0;
+    }
     return m0.properties.level - m1.properties.level;
 }
 
@@ -1497,6 +1666,9 @@ function hashCode(s) {
 // 转换后gl中的highlightMesh方法只需要考虑id相关逻辑
 function convertHighlights(mesh, layer, inputHighlights) {
     const properties = mesh instanceof reshader.InstancedMesh ? mesh.properties : mesh.geometry.properties;
+    if (!properties) {
+        return new Map();
+    }
     const { aPickingId, feaIdPickingMap, features } = properties;
     const highlights = new Map();
     const names = inputHighlights.keys();
@@ -1506,6 +1678,10 @@ function convertHighlights(mesh, layer, inputHighlights) {
             continue;
         }
         if (!isNil(highlight.id)) {
+            // 无 feaIdPickingMap 的 mesh（如 feature id 非数字类型时）无法进行 id → pickingId 的映射转换
+            if (!feaIdPickingMap) {
+                continue;
+            }
             const pickingIds = feaIdPickingMap[highlight.id];
             if (!pickingIds || !pickingIds.length) {
                 continue;
@@ -1513,7 +1689,8 @@ function convertHighlights(mesh, layer, inputHighlights) {
             for (let i = 0; i < pickingIds.length; i++) {
                 highlights.set(pickingIds[i], highlight);
             }
-        } else if (highlight.filter && aPickingId) {
+        } else if (highlight.filter && aPickingId && features) {
+            // features 可能因瓦片 dispose（GC 优化）被置空，此时该 mesh 无法做 filter 高亮，直接跳过
             let current = null;
             for (let i = 0; i < aPickingId.length; i++) {
                 if (aPickingId[i] !== current) {

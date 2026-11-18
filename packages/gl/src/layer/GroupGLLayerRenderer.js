@@ -88,11 +88,19 @@ class GroupGLLayerRenderer extends CanvasCompatible(LayerAbstractRenderer) {
         if (!this.getMap() || !this.layer.isVisible()) {
             return;
         }
+        // 记录交互帧绘制开始时间，用于计算真实 GL 渲染耗时。
+        // Mark the start of this interacting-frame draw to measure actual GL render cost.
+        const t = maptalks.Util.now();
         this.layer._updatePolygonOffset();
         this['_toRedraw'] = false;
         this._renderChildLayers('drawOnInteracting', args);
         this._renderOutlines();
         this._postProcess();
+        //回写交互帧真实渲染耗时，供 MapCanvasRenderer 的 fpsOnInteracting 帧预算（inTime）判断使用，
+        //避免 _drawTime 陈旧导致 inTime 恒 true 而每帧全量重绘 GL，让重绘耗时超过帧预算时自动降频
+        // Write back the actual interacting-frame render duration so MapCanvasRenderer's fpsOnInteracting budget (inTime) uses fresh data;
+        // stale _drawTime otherwise keeps inTime=true and forces a full GL repaint every frame, defeating the auto-throttle when rendering exceeds the frame budget.
+        this._drawTime = maptalks.Util.now() - t;
     }
 
     _renderChildLayers(methodName, args) {
@@ -1041,8 +1049,15 @@ class GroupGLLayerRenderer extends CanvasCompatible(LayerAbstractRenderer) {
     _renderShadow(context) {
         const fbo = context.renderTarget && context.renderTarget.fbo;
         const sceneConfig = this.layer._getSceneConfig();
-        const meshes = [];
+        // 强制刷新阴影：光照方向变化或视图矩阵变化时必须重新计算阴影贴图。
+        // Force shadow re-render when light direction or the view matrix has changed.
         let forceUpdate = context.states.lightDirectionChanged || context.states.viewChanged;
+        // 每次使用新的临时数组收集 mesh，避免修改 Scene 已持有的引用
+        // Collect mesh refs into a fresh temporary array each pass — never mutate the Scene's held array in-place.
+        const newMeshes = [];
+        // 没有上次快照时直接视为 mesh 集合已变化，跳过无意义的逐项比对。
+        // When there is no previous snapshot, treat the mesh set as changed and skip the per-index compare.
+        let meshesChanged = !this._shadowMeshesPrev;
         this.forEachRenderer((renderer, layer) => {
             if (!renderer.getShadowMeshes || !layer.isVisible()) {
                 return;
@@ -1050,27 +1065,47 @@ class GroupGLLayerRenderer extends CanvasCompatible(LayerAbstractRenderer) {
             const shadowMeshes = renderer.getShadowMeshes();
             if (Array.isArray(shadowMeshes)) {
                 for (let i = 0; i < shadowMeshes.length; i++) {
-                    if (!shadowMeshes[i]) {
+                    const sm = shadowMeshes[i];
+                    if (!sm) {
                         continue;
                     }
-                    if (shadowMeshes[i].needUpdateShadow) {
+                    // 单体 mesh 标记自身需要刷新（例如高度改变），消费后立即清除。
+                    // Per-mesh dirty flag consumed on this pass and reset immediately (set once by the mesh owner when altitude/geometry changes).
+                    if (sm.needUpdateShadow) {
                         forceUpdate = true;
-                        shadowMeshes[i].needUpdateShadow = false;
+                        sm.needUpdateShadow = false;
                     }
-                    if (shadowMeshes[i].hasFunctionUniform) {
-                        if (!shadowMeshes[i].hasFunctionUniform('minAltitude')) {
-                            shadowMeshes[i].setFunctionUniform('minAltitude', () => {
-                                return layer && layer.options.altitude || 0;
-                            });
+                    // 阴影贴图只绘制带函数 uniform 的 mesh，跳过不参与高度投影的静态几何体。
+                    // Only meshes that carry the function uniform pipeline participate in shadow projection; skip static geometry here.
+                    if (!sm.hasFunctionUniform) {
+                        continue;
+                    }
+                    // 用 _hasMinAltitude 标记位替代每帧的 hasFunctionUniform 调用，避免重复属性查找
+                    if (!sm._hasMinAltitude) {
+                        sm.setFunctionUniform('minAltitude', () => {
+                            return layer && layer.options.altitude || 0;
+                        });
+                        sm._hasMinAltitude = true;
+                    }
+                    // 与上一次的 mesh 列表做引用比对，一旦发现不一致即标记变化
+                    if (!meshesChanged) {
+                        const idx = newMeshes.length;
+                        if (idx >= this._shadowMeshesPrev.length || this._shadowMeshesPrev[idx] !== sm) {
+                            meshesChanged = true;
                         }
-                        meshes.push(shadowMeshes[i]);
                     }
+                    newMeshes.push(sm);
                 }
             }
         });
-        // if (!meshes.length) {
-        //     return null;
-        // }
+        // 当内容未变且长度匹配时，复用上一次的数组引用，使 Scene.setMeshes 的引用比较生效，避免 Scene 重建
+        let meshes;
+        if (!meshesChanged && newMeshes.length === this._shadowMeshesPrev.length) {
+            meshes = this._shadowMeshesPrev;
+        } else {
+            meshes = newMeshes;
+            this._shadowMeshesPrev = newMeshes;
+        }
         if (!this._shadowScene) {
             this._shadowScene = new reshader.Scene();
         }
@@ -1376,8 +1411,19 @@ class GroupGLLayerRenderer extends CanvasCompatible(LayerAbstractRenderer) {
         }
 
         if (enableSSR) {
-            this._postProcessor.genSsrMipmap(tex, this._blitDepthTex());
+            // 性能优化：仅当视图变化或需刷新SSR时才重新生成 mipmap，避免每帧7次 fullscreen blit
+            // Perf guard: SSR mipmap is regenerated only when the view / light / dirty flag actually changes,
+            // otherwise we skip the 7 fullscreen blits per frame that genSsrMipmap spends on each level.
+            const viewStates = this._getViewStates && this._getViewStates();
+            const viewChanged = viewStates && viewStates.viewChanged;
+            const lightDirectionChanged = viewStates && viewStates.lightDirectionChanged;
+            if (this._needUpdateSSR || viewChanged || lightDirectionChanged) {
+                this._postProcessor.genSsrMipmap(tex, this._blitDepthTex());
+            }
             if (this._needUpdateSSR) {
+                // 需要触发下一帧重绘（一般因 SSR 材质参数改变），同时保留外部传入的帧退休配额不被覆盖。
+                // Kick one more redraw (typically because SSR material params changed) but preserve
+                // any pre-existing retire-frames count set by an outer caller.
                 const needRetireFrames = this._needRetireFrames;
                 this.setToRedraw();
                 this._needRetireFrames = needRetireFrames;

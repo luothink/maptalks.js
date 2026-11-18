@@ -284,7 +284,7 @@ class MeshPainter extends Painter {
             return EMPTY_ARRAY;
         }
         this.shadowCount = this.scene.getMeshes().length;
-        const meshes = this.scene.getMeshes().filter(m => m.properties.level === 0);
+        const meshes = this.scene.getMeshes().filter(m => m && m.properties && m.properties.level === 0);
         for (let i = 0; i < meshes.length; i++) {
             const mesh = meshes[i];
             if (mesh.material !== this.material) {

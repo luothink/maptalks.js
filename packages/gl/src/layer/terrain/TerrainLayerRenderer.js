@@ -1124,13 +1124,13 @@ class TerrainLayerRenderer extends MaskRendererMixin(TileLayerRendererable(Layer
         if (!tile || !tile.image) {
             return;
         }
-        super.deleteTile(tile);
         const { info, image } = tile;
+        super.deleteTile(tile);
         if (image.temp) {
             return;
         }
         delete info.skinTileIds;
-        this._deleteTerrainImage(tile.info, image);
+        this._deleteTerrainImage(info, image);
 
     }
 

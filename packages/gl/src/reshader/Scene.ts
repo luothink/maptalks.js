@@ -1,16 +1,24 @@
 import { vec3 } from 'gl-matrix';
 import Mesh from './Mesh';
 
-const P0: vec3 = [0, 0, 0], P1: vec3 = [0, 0, 0];
+// 临时向量，用于在 _sortTransparentsByDistance 中复用，避免逐次分配内存。
+// Temporary scratch vector reused inside _sortTransparentsByDistance to avoid per-call memory allocations.
+const TEMP_CENTER: vec3 = [0, 0, 0];
 let uid = 0;
 
-let CAM_POS;
-function compare(a: Mesh, b: Mesh) {
-    vec3.transformMat4(P0, a.geometry.boundingBox.getCenter(), a.localTransform);
-    vec3.transformMat4(P1, b.geometry.boundingBox.getCenter(), b.localTransform);
-    return vec3.dist(P1, CAM_POS) - vec3.dist(P0, CAM_POS);
-}
+// 预计算的透明mesh排序数据，避免在compare函数中频繁计算OBB中心和距离。
+// Pre-computed distance cache for transparent mesh sorting, avoids per-comparison OBB center + distance recalculation inside Array.sort()'s compare callback.
+let _distCache: Float64Array = new Float64Array(256);
+let _distCacheSize = 256;
 
+// 动态扩容距离缓存数组，保证 _sortTransparentsByDistance 写操作不越界。
+// Dynamically expands the distance buffer so _sortTransparentsByDistance never writes out-of-bounds.
+function ensureDistCacheSize(size: number) {
+    if (size > _distCacheSize) {
+        _distCache = new Float64Array(size);
+        _distCacheSize = size;
+    }
+}
 
 class Scene {
     //@internal
@@ -20,8 +28,13 @@ class Scene {
     sortedMeshes: { opaques?: Mesh[], transparents?: Mesh[] }
     sortFunction?: (a: Mesh, b: Mesh) => number
     meshes?: Mesh[]
+    //@internal 用于 O(1) 判定 mesh 是否已存在，替代原 indexOf 线性扫描。
+    //@internal O(1) membership set, replaces the previous O(n) indexOf linear scan in addMesh/removeMesh.
+    _meshSet?: Set<Mesh>
     //@internal
     _dirty: boolean
+    //@internal 缓存上一次透明的mesh排序使用的相机位置
+    _lastSortCamPos?: vec3
 
     constructor(meshes) {
         this._id = uid++;
@@ -37,14 +50,18 @@ class Scene {
         }
         meshes = Array.isArray(meshes) ? meshes : [meshes];
         this.meshes = [];
+        // 复用 _meshSet（clear() 中已清空），避免每次调用都 new Set()
+        // Reuse _meshSet (already cleared in clear()) to avoid allocating a new Set every call.
+        const set = this._meshSet;
         for (let i = 0; i < meshes.length; i++) {
             const mesh = meshes[i] as any;
-            if (!mesh) {
+            // 过滤掉未初始化完成（无 properties 对象）的 mesh，避免后续写 set / properties 访问异常。
+            // Skip uninitialized meshes that don't yet carry a .properties bag, which we rely on for per-mesh cache slots.
+            if (!mesh || !mesh.properties) {
                 continue;
             }
-            // mesh._scenes = mesh._scenes || {};
-            // mesh._scenes[this._id] = 1;
             this.meshes.push(mesh);
+            set.add(mesh);
         }
         this.dirty();
         return this;
@@ -55,13 +72,18 @@ class Scene {
             return this;
         }
         const meshes = Array.isArray(mesh) ? mesh : [mesh];
+        // 懒初始化 _meshSet：首次 addMesh 才分配，减少空 Scene 的内存占用。
+        // Lazy-init _meshSet only on first add to keep empty Scenes lightweight.
+        const set = this._meshSet || (this._meshSet = new Set<Mesh>());
         for (let i = 0, len = meshes.length; i < len; i++) {
             const mesh = meshes[i];
-            if (mesh && this.meshes.indexOf(mesh) === -1) {
+            // Set.has 去重 + properties 守卫，确保不会把同一 mesh / 未初始化 mesh 重复压入 meshes 数组。
+            // Dedupe via Set.has plus the .properties guard, so the same mesh (or an incomplete one) never gets pushed twice.
+            if (mesh && mesh.properties && !set.has(mesh)) {
+                set.add(mesh);
                 this.meshes.push(mesh);
                 this.dirty();
             }
-
         }
         return this;
     }
@@ -71,18 +93,30 @@ class Scene {
             return this;
         }
         const meshes = Array.isArray(mesh) ? mesh : [mesh];
-        const needRemoveMehes: Mesh[] = [];
+        const set = this._meshSet;
+        // 没有 _meshSet 意味着从未 add 过任何 mesh，直接短路返回。
+        // Short-circuit when _meshSet was never allocated — nothing was added so nothing to remove.
+        if (!set) {
+            return this;
+        }
+        // 命中标记：只要删除了至少一个 mesh，才重新构建 meshes 数组 + 置 dirty。
+        // Hit flag — rebuild .meshes and flip dirty only when at least one mesh was actually removed.
+        let hit = false;
         for (let i = 0; i < meshes.length; i++) {
             const mesh = meshes[i];
-            if (mesh && this.meshes.indexOf(mesh) >= 0) {
-                needRemoveMehes.push(mesh);
+            if (mesh && set.has(mesh)) {
+                hit = true;
+                set.delete(mesh);
             }
         }
-        if (needRemoveMehes.length > 0) {
+        if (hit) {
             const filterMeshes = [];
-            for (let i = 0; i < this.meshes.length; i++) {
-                const mesh = this.meshes[i];
-                if (needRemoveMehes.indexOf(mesh) === -1) {
+            const srcMeshes = this.meshes;
+            for (let i = 0; i < srcMeshes.length; i++) {
+                const mesh = srcMeshes[i];
+                // 以 Set 为真值源重建 meshes，同时再次校验 properties 以过滤残留的脏引用。
+                // Rebuild .meshes using the Set as source of truth; re-check .properties to drop any stale references.
+                if (mesh && mesh.properties && set.has(mesh)) {
                     filterMeshes.push(mesh);
                 }
             }
@@ -92,70 +126,23 @@ class Scene {
         return this;
     }
 
-    // addMesh(mesh: Mesh | Mesh[]) {
-    //     if (!mesh || (Array.isArray(mesh) && !mesh.length)) {
-    //         return this;
-    //     }
-    //     const meshes = Array.isArray(mesh) ? mesh : [mesh];
-    //     for (let i = 0, len = meshes.length; i < len; i++) {
-    //         const m = meshes[i];
-    //         const scenes = (m as any)._scenes = (m as any)._scenes || {};
-    //         if (!scenes[this._id]) {
-    //             scenes[this._id] = 1;
-    //             this.meshes.push(m);
-    //             this.dirty();
-    //         }
-    //     }
-    //     return this;
-    // }
-
-
-    // removeMesh(mesh?: Mesh | Mesh[]) {
-    //     if (!mesh || (Array.isArray(mesh) && !mesh.length)) { return this; }
-    //     if (Array.isArray(mesh)) {
-    //         let hit = false;
-    //         for (let i = 0; i < mesh.length; i++) {
-    //             const scenes = (mesh[i] as any)._scenes;
-    //             if (scenes && scenes[this._id]) {
-    //                 hit = true;
-    //                 this.dirty();
-    //                 delete scenes[this._id];
-    //             }
-    //         }
-    //         if (hit) {
-    //             this.meshes = this.meshes.filter(el => {
-    //                 return mesh.indexOf(el) < 0;
-    //             });
-    //         }
-    //     } else {
-    //         const scenes = (mesh as any)._scenes;
-    //         if (!scenes || !scenes[this._id]) {
-    //             return this;
-    //         }
-    //         const idx = this.meshes.indexOf(mesh);
-    //         if (idx >= 0) {
-    //             this.meshes.splice(idx, 1);
-    //         }
-    //         delete scenes[this._id];
-    //         this.dirty();
-    //     }
-    //     return this;
-    // }
-
     getMeshes() {
         return this.meshes || [];
     }
 
 
     clear() {
-        // if (this.meshes) {
-        //     for (let i = 0; i < this.meshes.length; i++) {
-        //         delete (this.meshes[i] as any)._scenes[this._id];
-        //     }
-        // }
         this.meshes = [];
+        if (this._meshSet) {
+            this._meshSet.clear();
+        } else {
+            this._meshSet = new Set<Mesh>();
+        }
         this.sortedMeshes.opaques = [];
         this.sortedMeshes.transparents = [];
+        // 清空相机位置缓存，下次 sortMeshes 必定重排。
+        // Drop the cached camera position so the next sortMeshes call will re-sort from scratch.
+        this._lastSortCamPos = undefined;
         return this;
     }
 
@@ -170,7 +157,6 @@ class Scene {
             meshes.sort(this.sortFunction);
         }
 
-        //sort meshes by defines
         let transparents = this.sortedMeshes.transparents;
         if (this._dirty) {
             const opaques = this.sortedMeshes.opaques = [];
@@ -182,21 +168,64 @@ class Scene {
                     opaques.push(meshes[i]);
                 }
             }
+            this._lastSortCamPos = undefined;
         }
 
-        // 即使是opaques，渲染顺序也不能随便改变，因为可能有stencil测试，或者depthMask等会因渲染顺序影响渲染效果的设置
-        // opaques.sort((a, b) => {
-        //     if (a.getDefinesKey() === b.getDefinesKey()) {
-        //         return 0;
-        //     }
-        //     return 1;
-        // });
         if (cameraPosition && transparents.length > 1) {
-            CAM_POS = cameraPosition;
-            transparents.sort(compare);
+            // 检查相机位置是否与上次排序时相同（允许微小误差），避免静态帧下执行 O(n log n) 重排。
+            // Skip re-sort if camera hasn't moved (within epsilon); avoids O(n log n) work on static frames.
+            const lastPos = this._lastSortCamPos;
+            const sameCam = lastPos &&
+                Math.abs(lastPos[0] - cameraPosition[0]) < 1e-6 &&
+                Math.abs(lastPos[1] - cameraPosition[1]) < 1e-6 &&
+                Math.abs(lastPos[2] - cameraPosition[2]) < 1e-6;
+
+            if (!sameCam) {
+                // 预计算每个透明mesh到相机的距离，避免compare函数中重复计算OBB中心，
+                // 完成排序后快照相机位置供下一帧判定。
+                // Pre-compute distances then sort in one pass, and snapshot the camera position for next frame.
+                this._sortTransparentsByDistance(transparents, cameraPosition);
+                if (!this._lastSortCamPos) {
+                    this._lastSortCamPos = vec3.create();
+                }
+                vec3.copy(this._lastSortCamPos, cameraPosition);
+            }
         }
 
         this._dirty = false;
+    }
+
+    // 预计算距离并按距相机远近排序透明mesh（远→近），原地插入排序以获得稳定的渲染顺序。
+    // Pre-compute per-mesh distances and insertion-sort transparents back-to-front (far → near) in-place.
+    _sortTransparentsByDistance(transparents: Mesh[], cameraPosition: vec3) {
+        const len = transparents.length;
+        // 确保距离缓存足够容纳当前所有透明 mesh。
+        // Ensure the scratch distance buffer fits every transparent mesh we are about to sort.
+        ensureDistCacheSize(len);
+
+        // 预计算每个mesh的OBB中心到相机的距离（平方距离，避免开方）
+        // Pass 1: transform each mesh's OBB center to world space and store squared distance to camera.
+        for (let i = 0; i < len; i++) {
+            const mesh = transparents[i];
+            const center = mesh.geometry.boundingBox.getCenter();
+            vec3.transformMat4(TEMP_CENTER, center, mesh.localTransform);
+            _distCache[i] = vec3.sqrDist(TEMP_CENTER, cameraPosition);
+        }
+
+        // 原地排序，按距离降序（远处先渲染）保证半透明混合正确顺序
+        // Pass 2: in-place insertion sort by descending squared distance (farther meshes drawn first for correct transparency blending).
+        for (let i = 1; i < len; i++) {
+            const curMesh = transparents[i];
+            const curDist = _distCache[i];
+            let j = i - 1;
+            while (j >= 0 && _distCache[j] < curDist) {
+                transparents[j + 1] = transparents[j];
+                _distCache[j + 1] = _distCache[j];
+                j--;
+            }
+            transparents[j + 1] = curMesh;
+            _distCache[j + 1] = curDist;
+        }
     }
 
     getSortedMeshes(): { opaques?: Mesh[], transparents?: Mesh[] } {

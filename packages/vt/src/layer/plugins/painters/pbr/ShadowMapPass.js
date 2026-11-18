@@ -73,7 +73,9 @@ class VSMShadowPass {
             smap = this._shadowMap = shadowMap;
             fbo = this._blurFBO = blurFBO;
             this._renderedShadows = scene.getMeshes().reduce((ids, m) => {
-                ids[m.properties.meshKey] = 1;
+                if (m && m.properties) {
+                    ids[m.properties.meshKey] = 1;
+                }
                 return ids;
             }, {});
             const cache = MapStateCache[map.id];
@@ -132,6 +134,9 @@ class VSMShadowPass {
         const meshes = scene.getMeshes();
         let changed = false;
         for (let i = 0; i < meshes.length; i++) {
+            if (!meshes[i] || !meshes[i].properties) {
+                continue;
+            }
             if (!this._renderedShadows[meshes[i].properties.meshKey]) {
                 return true;
             }

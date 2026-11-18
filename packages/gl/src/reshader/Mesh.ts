@@ -260,8 +260,12 @@ export default class Mesh {
         // }
 
         this._updateUniformState(k);
+        if (Object.prototype.hasOwnProperty.call(this.uniforms, k)) {
+            delete this.uniforms[k];
+        }
         Object.defineProperty(this.uniforms, k, {
             enumerable: true,
+            configurable: true,
             get: fn
         });
         return this;
@@ -532,6 +536,11 @@ export default class Mesh {
         delete this._bindGroupCache;
         delete this._commandKeyCache;
         this.uniforms = null;
+        // Drop per-tile properties (e.g. symbolIndex, feature binding) so closures
+        // and temporary objects don't keep the tile data alive.
+        // 释放逐瓦片的属性（如 symbolIndex、要素绑定），避免闭包
+        // 和临时对象长期持有瓦片数据导致其无法被回收。
+        this.properties = null;
         if (this._meshBuffer) {
             for (const key in this._meshBuffer) {
                 this._meshBuffer[key].dispose();

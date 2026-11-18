@@ -12,7 +12,7 @@ import type EditOutline from '../edit/EditOutline';
 import type { Layer } from '../../layer';
 import type Size from '../../geo/Size';
 import type { WithUndef } from '../../types/typings';
-import { getDefaultBBOX, pointsBBOX } from '../../core/util/bbox';
+
 import { updateMapStateCache } from './../../map/MapStateCache'
 
 const tempCollisionIndex = new CollisionIndex();
@@ -73,6 +73,15 @@ class MapAbstractRenderer extends MapRenderer {
     _tops: (EditHandle | EditOutline)[];
     //@internal
     _forceRedraw: boolean;
+    //@internal 缓存的地图视口状态对象（当前帧正在使用的有效快照），用于视图一致性判定。
+    // Cached map-view state object (the active snapshot in use this frame) for view-consistency checks.
+    _cachedMapView: MapView;
+    //@internal 上一帧已提交的地图视口状态快照，用于检测视图是否实际变化（避免无意义的全量重绘）。
+    // Snapshot of the previously committed map-view state; used to detect whether the view actually changed (avoids pointless full repaints).
+    _cachedMapViewSnap: MapView;
+    //@internal 复用的 Point/ring/bbox 缓存对象，用于 _updateMapCurrentViewGLInfo，消除每帧分配 5 个 Point + 临时数组的 GC 压力。
+    // Reusable Point/ring/bbox cache bag consumed by _updateMapCurrentViewGLInfo; removes per-frame allocations of 5 Points + temp arrays and cuts GC pressure.
+    _glInfoCache: { p1: Point; p2: Point; p3: Point; p4: Point; ring: Point[]; bbox: number[]; center: Point };
 
     context: any;
     canvas: HTMLCanvasElement;
@@ -113,19 +122,32 @@ class MapAbstractRenderer extends MapRenderer {
             return this;
         }
         const bufferSize = 100;
-        const { xmin, ymin, xmax, ymax } = containerExtent
+        const { xmin, ymin, xmax, ymax } = containerExtent;
 
-        const p1 = new Point(xmin, ymin);
-        const p2 = new Point(xmax, ymin);
-        const p3 = new Point(xmax + bufferSize, ymax + bufferSize);
-        const p4 = new Point(xmin - bufferSize, ymax + bufferSize);
+        // reuse Point objects to eliminate per-frame allocation
+        let pts = this._glInfoCache;
+        if (!pts) {
+            pts = this._glInfoCache = {
+                p1: new Point(0, 0), p2: new Point(0, 0),
+                p3: new Point(0, 0), p4: new Point(0, 0),
+                ring: [null, null, null, null],
+                bbox: [0, 0, 0, 0],
+                center: new Point(0, 0)
+            };
+        }
+        const { p1, p2, p3, p4, ring, bbox, center } = pts;
+        p1.x = xmin; p1.y = ymin;
+        p2.x = xmax; p2.y = ymin;
+        p3.x = xmax + bufferSize; p3.y = ymax + bufferSize;
+        p4.x = xmin - bufferSize; p4.y = ymax + bufferSize;
         const scale = map._getResolution() / map.getGLRes();
-        let ring = [p1, p2, p3, p4].map(p => {
-            return map._containerPointToPoint(p)._multi(scale);
-        })
+        ring[0] = map._containerPointToPoint(p1)._multi(scale);
+        ring[1] = map._containerPointToPoint(p2)._multi(scale);
+        ring[2] = map._containerPointToPoint(p3)._multi(scale);
+        ring[3] = map._containerPointToPoint(p4)._multi(scale);
         const RB = ring[2];
         const LB = ring[3];
-        ring = ring.sort((a, b) => {
+        ring.sort((a, b) => {
             return b.y - a.y;
         });
 
@@ -145,10 +167,17 @@ class MapAbstractRenderer extends MapRenderer {
             lb = rp2;
             rb = rp1;
         }
-        const bbox = getDefaultBBOX();
-        pointsBBOX(ring, bbox);
-        const [minx, miny, maxx, maxy] = bbox;
-        const center = new Point((minx + maxx) / 2, (miny + maxy) / 2);
+        bbox[0] = bbox[1] = Infinity;
+        bbox[2] = bbox[3] = -Infinity;
+        for (let i = 0; i < ring.length; i++) {
+            const p = ring[i];
+            if (p.x < bbox[0]) bbox[0] = p.x;
+            if (p.y < bbox[1]) bbox[1] = p.y;
+            if (p.x > bbox[2]) bbox[2] = p.x;
+            if (p.y > bbox[3]) bbox[3] = p.y;
+        }
+        center.x = (bbox[0] + bbox[2]) / 2;
+        center.y = (bbox[1] + bbox[3]) / 2;
         /**
          *  LT---------------RT
          *   \               /
@@ -184,7 +213,10 @@ class MapAbstractRenderer extends MapRenderer {
      */
     renderFrame(framestamp: number): boolean {
         this._updateMapStateCache();
-        this._updateMapCurrentViewGLInfo();
+        // 仅在视图变化或首帧时重算 GL 视图信息，避免每帧冗余计算
+        if (this.isViewChanged() || !this.map._currentViewGLInfo) {
+            this._updateMapCurrentViewGLInfo();
+        }
         const map = this.map;
         if (!map || !map.options['renderable']) {
             return false;
@@ -213,8 +245,8 @@ class MapAbstractRenderer extends MapRenderer {
         map._fireEvent('frameend');
         this._recordView();
         // refresh map's state
-        // It must be before events and frame callback, because map state may be changed in callbacks.
-        this._mapview = this._getMapView();
+        // Use snapshot to keep a stable copy for next frame's isViewChanged comparison
+        this._mapview = this._snapshotMapView();
         delete this._spatialRefChanged;
         this._fireLayerLoadEvents(layers);
         this.executeFrameCallbacks();
@@ -593,15 +625,39 @@ class MapAbstractRenderer extends MapRenderer {
     _getMapView(): MapView {
         const map = this.map;
         const center = map._getPrjCenter();
-        return {
-            x: center.x,
-            y: center.y,
-            zoom: map.getZoom(),
-            pitch: map.getPitch(),
-            bearing: map.getBearing(),
-            width: map.width,
-            height: map.height
-        };
+        // reuse cached view object to avoid per-frame allocation.
+        // _getMapView is called per-frame via isViewChanged() and renderFrame().
+        // We use a cached object that the caller must clone if they need to keep a snapshot.
+        let view = this._cachedMapView;
+        if (!view) {
+            view = this._cachedMapView = { x: 0, y: 0, zoom: 0, pitch: 0, bearing: 0, width: 0, height: 0 };
+        }
+        view.x = center.x;
+        view.y = center.y;
+        view.zoom = map.getZoom();
+        view.pitch = map.getPitch();
+        view.bearing = map.getBearing();
+        view.width = map.width;
+        view.height = map.height;
+        return view;
+    }
+
+    //@internal
+    _snapshotMapView(): MapView {
+        const src = this._getMapView();
+        // Clone into a separate snapshot object so isViewChanged compares correctly
+        let snap = this._cachedMapViewSnap;
+        if (!snap) {
+            snap = this._cachedMapViewSnap = { x: 0, y: 0, zoom: 0, pitch: 0, bearing: 0, width: 0, height: 0 };
+        }
+        snap.x = src.x;
+        snap.y = src.y;
+        snap.zoom = src.zoom;
+        snap.pitch = src.pitch;
+        snap.bearing = src.bearing;
+        snap.width = src.width;
+        snap.height = src.height;
+        return snap;
     }
 
     //@internal

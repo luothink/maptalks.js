@@ -250,6 +250,10 @@ export class Map extends Handlerable(Eventable(Renderable(Class))) {
     //@internal
     _glScale: number;
     //@internal
+    _meterToGLPoint: number;
+    //@internal
+    _meterToGLPointRes: number;
+    //@internal
     _cursor: string;
     //@internal
     _prjCenter: Coordinate;
@@ -743,7 +747,28 @@ export class Map extends Handlerable(Eventable(Renderable(Class))) {
         const tanB = Math.tan(fov / 2);
         const tanP = Math.tan(visualPitch);
 
-        const visualDistance = (cameraToCenter * tanB) / (1 / tanP - tanB) / Math.sin(visualPitch);
+        // Guard against visualPitch exceeding the camera's field of view boundary.
+        // When tanP > 1/tanB, the denominator (1/tanP - tanB) becomes negative or zero,
+        // which causes visualDistance to approach infinity or become negative.
+        // At extreme pitch angles (e.g., >71.5° with default FOV), the standard projection
+        // breaks down mathematically. Clamping ensures the container extent remains valid
+        // so tiles are not incorrectly culled, preventing a white screen at large tilt angles.
+        // 防止 visualPitch 超出相机视场边界。
+        // 当 tanP > 1/tanB 时，分母 (1/tanP - tanB) 变为负数或零，
+        // 导致 visualDistance 趋于无穷大或变为负数。
+        // 在极端倾角（如默认 FOV 下 >71.5°）时，标准投影在数学上失效。
+        // 此处钳制保证容器范围保持有效，瓦片不会被错误剔除，
+        // 从而防止大倾角时出现白屏。
+        const denominator = 1 / tanP - tanB;
+        if (denominator <= 1e-6) {
+            // Visual pitch is beyond the camera frustum boundary.
+            // Return a large visual height to keep ground tiles visible.
+            // 可视倾角已超出相机视锥体边界。
+            // 返回一个较大的可视高度，保持地面瓦片可见。
+            return this.height * 1.5;
+        }
+
+        const visualDistance = (cameraToCenter * tanB) / denominator / Math.sin(visualPitch);
         const x = cameraToCenter * (Math.sin(pitch) * visualDistance / (cameraToCenter + Math.cos(pitch) * visualDistance));
 
         return this.height / 2 + x;

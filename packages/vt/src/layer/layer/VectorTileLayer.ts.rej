@@ -1,0 +1,103 @@
+diff a/packages/vt/src/layer/layer/VectorTileLayer.ts b/packages/vt/src/layer/layer/VectorTileLayer.ts	(rejected hunks)
+@@ -2084,59 +2378,67 @@ function checkStyleExist(styles, idx) {
+ // maptalks.SpatialReference.registerPreset('preset-vt-3857', preset3857);
+ 
+ export type VectorTileLayerOptionsType = {
+-    renderer?: "gl",
+-    altitudeProperty?: string,
+-    features?: boolean,
+-    schema?: boolean,
+-    collision?: boolean,
+-    collisionBuffserSize?: number,
+-    picking?: boolean,
+-    pickingPoint?: boolean,
+-    pickingGeometry?: boolean,
++    renderer?: "gl";
++    altitudeProperty?: string;
++    /**
++     * Controls how feature payload is retained for interaction APIs.
++     * - `true`: keep runtime feature objects for interaction without requesting an extra full JSON copy.
++     * - `'id'`: only keep feature ids in worker payload; GeoJSONVectorTileLayer can hydrate them from the main-thread id map.
++     * - `'full'`: request an additional full feature JSON payload (`featuresTypeArray`) from worker.
++     * - `'transient'`: internal mode for transient feature delivery.
++     */
++    features?: boolean | "id" | "transient" | "full";
++    schema?: boolean;
++    collision?: boolean;
++    collisionBuffserSize?: number;
++    picking?: boolean;
++    pickingPoint?: boolean;
++    pickingGeometry?: boolean;
+     //每帧每个瓦片最多能绘制的sdf数量
+-    glyphSdfLimitPerFrame?: number,
++    glyphSdfLimitPerFrame?: number;
+     //zooming或zoom fading时，每个瓦片最多能绘制的box(icon或text)数量
+     // boxLimitOnZoomout: 7,
+-    antialias?: boolean,
+-    iconErrorUrl?: string,
+-    collisionFrameLimit?: number,
++    antialias?: boolean;
++    iconErrorUrl?: string;
++    collisionFrameLimit?: number;
+     //是否开启无style时的默认绘制功能
+-    defaultRendering?: boolean,
++    defaultRendering?: boolean;
+     //允许用户调整文字的gamma清晰度
+-    textGamma?: number,
++    textGamma?: number;
+     // altas中会在四周留一个像素的空隙，所以设为254，最大尺寸的icon也刚好存入256高宽的图片中
+-    maxIconSize?: number,
++    maxIconSize?: number;
+     workarounds?: {
+         //#94, text rendering crashes on windows with intel gpu
+         // 2022-12-06, 用当前版本测试crash.html，已经不再崩溃，关闭该workaround, http://localhost/bugs/issue-175/webgl_crash/crash2.html
+-        "win-intel-gpu-crash"?: boolean,
+-    },
+-    styleScale?: number,
+-    enableAltitude?: true,
++        "win-intel-gpu-crash"?: boolean;
++    };
++    styleScale?: number;
++    enableAltitude?: true;
+ 
+-    debugTileData?: boolean,
++    debugTileData?: boolean;
+     debugTile?: boolean;
+ 
+-    altitudeQueryTimeLimitPerFrame?: number,
+-    workerGlyph?: boolean,
++    altitudeQueryTimeLimitPerFrame?: number;
++    workerGlyph?: boolean;
+     sdfURL?: string;
+     // A property to use as a feature id (for feature state)
+     // https://docs.mapbox.com/style-spec/reference/sources/#vector-promoteId
+-    featureIdProperty?: string,
+-    currentTilesFirst?: true,
++    featureIdProperty?: string;
++    currentTilesFirst?: true;
+ 
+-    style?: any,
++    style?: any;
+ 
+-    altitudePropertyName?: string,
+-    disableAltitudeWarning?: boolean,
+-    loadTileErrorLog?: boolean,
++    altitudePropertyName?: string;
++    disableAltitudeWarning?: boolean;
++    loadTileErrorLog?: boolean;
+     loadTileErrorLogIgnoreCodes?: Array<number>;
+-    loadTileCachMaxSize?: number;//unit is MB
++    loadTileCachMaxSize?: number; //unit is MB
+     loadTileCacheLog?: boolean;
++    dynamicCache?: boolean;
+ 
+-    renderBeforeTerrain?: boolean,
++    renderBeforeTerrain?: boolean;
+ } & TileLayerOptionsType;
+ 
+ export type AsyncFeatureQueryOptions = {
+-    countPerTime?: number
+-};
+\ No newline at end of file
++    countPerTime?: number;
++};

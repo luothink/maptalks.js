@@ -102,6 +102,9 @@ export function highlightMesh(regl, mesh, highlighted, timestamp, feaIdIndiceMap
     if (timestamp === highlightTimestamp) {
         return;
     }
+    if (!mesh.geometry || !mesh.geometry.properties || mesh.geometry.isDisposed()) {
+        return;
+    }
     const isInstanced = mesh instanceof reshader.InstancedMesh;
     const vertexCount = isInstanced ? mesh.instanceCount : mesh.geometry.getVertexCount();
     let { aHighlightColor, aHighlightOpacity } = mesh.geometry.properties;
@@ -292,7 +295,7 @@ export function highlightMesh(regl, mesh, highlighted, timestamp, feaIdIndiceMap
 }
 
 export function deleteHighlightBloomMesh(mesh) {
-    if (!mesh) {
+    if (!mesh || !mesh.properties) {
         return;
     }
     const { hlBloomMesh } = mesh.properties;

@@ -785,12 +785,29 @@ Map.include(/** @lends Map.prototype */{
             // );
 
             // get field of view
-            let farZ = this._getCameraFar(fov, pitch);
+            // Use curPitch (actual pitch) for _getCameraFar to compute the correct base far distance.
+            // The cascade frustum should have a far plane >= the actual rendering frustum
+            // to include tiles above the horizon at high pitch angles.
+            // Previously using the cascade pitch (e.g., 60°) here caused 1/cos(60°)=2 vs
+            // 1/cos(80°)=5.76, making the cascade far plane 2.5x shorter than needed,
+            // which rejected visible tiles and caused a white screen at large tilt angles.
+            // 使用 curPitch（实际倾角）调用 _getCameraFar 计算正确的基础远平面距离。
+            // 级联视锥体的远平面必须 >= 实际渲染视锥体的远平面，
+            // 以包含高倾角时地平线以上的瓦片。
+            // 此前此处使用级联倾角（如 60°）导致 1/cos(60°)=2 与
+            // 1/cos(80°)=5.76 的差异，级联远平面比实际需要短 2.5 倍，
+            // 从而剔除可见瓦片，在大倾角时引发白屏。
+            let farZ = this._getCameraFar(fov, curPitch);
             const cameraCenterDistance = this.cameraCenterDistance;
+            // Adjust farZ from actual pitch's far distance to cascade pitch's far distance.
+            // At high pitch, the cascade far plane should extend further to cover tiles
+            // that appear above the horizon.
+            // 将 farZ 从实际倾角的远平面距离调整为级联倾角的远平面距离。
+            // 高倾角时，级联远平面应进一步延伸，以覆盖出现在地平线以上的瓦片。
             farZ = cameraCenterDistance + (farZ - cameraCenterDistance) / Math.cos((90 - pitch) * Math.PI / 180) * Math.cos((90 - curPitch) * Math.PI / 180);
 
             // camera projection matrix
-            mat4.perspective(projMatrix, fov, w / h, 0.1, farZ);
+            mat4.perspective(projMatrix, fov, w / h, this.cameraNear, farZ);
             // view matrix
             // mat4.invert(viewMatrix, worldMatrix);
             const viewMatrix = this.viewMatrix;
@@ -854,7 +871,9 @@ Map.include(/** @lends Map.prototype */{
         const q = {};
         return function () {
             const glRes = this.getGLRes();
-            if (!this._meterToGLPoint) {
+            //_meterToGLPoint 依赖 glRes，zoom 变化时必须重新计算，否则相机高度与远平面计算错误
+            if (!this._meterToGLPoint || this._meterToGLPointRes !== glRes) {
+                this._meterToGLPointRes = glRes;
                 this._meterToGLPoint = this.altitudeToPoint(100, glRes) / 100;
             }
 

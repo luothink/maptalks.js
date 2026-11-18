@@ -128,11 +128,12 @@ void main() {
         float blur = lineBlur;
     #endif
 
+    // 与 MapLibre line.fragment.glsl 保持一致：
+    // blur = (line-blur + 1/devicePixelRatio) * gammaScale
+    // 默认 line-blur=0 时仍有 1 像素抗锯齿边缘
+    // 注意使用上面已经过 HAS_PATTERN 调整的 blur，而不是原始 lineBlur
     float blur2 = (blur + 1.0 / DEVICE_PIXEL_RATIO) * vGammaScale;
     float alpha = clamp(min(dist - (vWidth.t - blur2), vWidth.s - dist) / blur2, 0.0, 1.0);
-    if (lineBlur == 0.0) {
-        alpha = 1.0;
-    }
     #ifdef HAS_COLOR
         vec4 color = vColor / 255.0;
     #else
@@ -234,9 +235,9 @@ void main() {
         perspectiveAlpha = clamp(cameraToCenterDistance * 1.5 / distance(vVertex, cameraPosition), 0.0, 1.0);
     }
 
-    // if (blendSrcIsOne == 1.0) {
-    //     gl_FragColor.rgb *= gl_FragColor.a;
-    // }
+    if (blendSrcIsOne == 1.0) {
+        gl_FragColor.rgb *= gl_FragColor.a;
+    }
 
     gl_FragColor *= perspectiveAlpha;
 

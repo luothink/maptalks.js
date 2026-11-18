@@ -568,6 +568,9 @@ export default class Geometry {
     getVertexCount(): number {
         const { positionAttribute, positionSize, color0Attribute } = this.desc;
         let data = this.data[positionAttribute];
+        if (!data) {
+            return this._vertexCount || 0;
+        }
         if (data.data) {
             data = data.data;
         }
@@ -885,6 +888,14 @@ export default class Geometry {
             }
             delete this.properties.oldElementsBeforeHighlight;
             delete this.properties.hasInvisible;
+            // VT tiles store full feature arrays on geometry.properties for picking.
+            // Drop the reference so the heavy feature/properties data can be GC'd
+            // once the tile is no longer needed.
+            // VT 瓦片会在 geometry.properties 上保存完整的要素数组用于拾取。
+            // 释放这些引用后，瓦片不再需要时，庞大的要素/属性数据即可被 GC 回收。
+            delete this.properties.features;
+            delete this.properties.featureIndexes;
+            delete this.properties.tile;
         }
         this.data = {};
         this._buffers = {};

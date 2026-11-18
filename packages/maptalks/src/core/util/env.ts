@@ -14,7 +14,9 @@ export function getGlobalThis() {
 
 export function checkMTKVersion(version) {
     const mtkversion = getGlobalThis().maptalksversion;
-    if (mtkversion) {
+    // 相同版本重复导入（如打包器对 UMD 的重复 require）应被容忍，
+    // 仅在不同版本冲突时抛出错误
+    if (mtkversion && mtkversion !== version) {
         throw new Error(`Disallow duplicate imports of maptalks version ${version} and ${mtkversion}`);
     } else {
         getGlobalThis().maptalksversion = version;

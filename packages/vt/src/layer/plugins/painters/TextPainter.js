@@ -123,11 +123,12 @@ export default class TextPainter extends CollisionPainter {
             return;
         }
         for (let i = 0; i < meshes.length; i++) {
-            if (meshes[i].properties.isHalo) {
+            // 跳过被 LRU 淘汰/数据刷新 dispose 的 mesh（properties 被置为 null）
+            if (!meshes[i] || !meshes[i].properties || meshes[i].properties.isHalo) {
                 continue;
             }
             const { haloMesh } = meshes[i].properties;
-            if (haloMesh.dirtyDefines) {
+            if (haloMesh && haloMesh.dirtyDefines) {
                 meshes[i].setDefines(haloMesh.defines);
             }
         }
@@ -308,6 +309,15 @@ export default class TextPainter extends CollisionPainter {
     }
 
     callBackgroundTileShader(uniforms, context) {
+        // 缩放结束后，zoomEndMeshes 被 _updateZoomMeshesLevel 清除（约325ms），
+        // 但背景瓦片仍可能在 tilesInView 中（_vtZoomEndGraceUntil 宽限期，最多600ms）。
+        // 此窗口内 shouldIgnoreBackground() 返回 true → 背景文字mesh变"不可迭代"
+        // → 碰撞检测和 unique placement merge 均被跳过，但 shaderFilterN 仍会渲染
+        // 背景文字（仅检查 !isForeground），导致中心区域新旧zoom文字以30% opacity重叠。
+        // 风格的修复：此窗口内完全跳过背景文字shader渲染。
+        if (this.shouldIgnoreBackground && this.shouldIgnoreBackground()) {
+            return;
+        }
         this.shader.filter = context.sceneFilter ? [this._filter1, context.sceneFilter] : this._filter1;
         this.callRenderer(this.shader, uniforms, context);
 
@@ -1096,6 +1106,10 @@ function resetOffset(aOffset, meshElements, start, end) {
 }
 
 function sortByLevel(m0, m1) {
+    // 防御：tile 被 LRU 淘汰或数据刷新时 mesh 可能已 dispose（properties 被置 null）
+    if (!m0 || !m0.properties || !m1 || !m1.properties) {
+        return 0;
+    }
     const r = m0.properties['level'] - m1.properties['level'];
     if (r === 0) {
         return m0.properties.meshKey - m1.properties.meshKey;

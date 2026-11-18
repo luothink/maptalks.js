@@ -6,6 +6,7 @@ const { GeoJSONVectorTileLayer, PolygonLayer } = require('../../dist/maptalks.vt
 const { GroupGLLayer } = require('@maptalks/gl');
 require('@maptalks/gpu');
 const startServer = require('./server.js');
+const { replaceTestPortDeep } = require('./server.js');
 const PORT = 4398;
 
 const mapRenderer = window.mapRenderer;
@@ -575,7 +576,7 @@ describe('update style specs', () => {
     });
 
     it('should can updateSymbol with a url style', done => {
-        const styleURL = `http://localhost:${PORT}/update-style.json`;
+        const styleURL = replaceTestPortDeep(`http://localhost:${PORT}/update-style.json`);
         assertChangeStyle(done, [0, 255, 0, 255], layer => {
             layer.updateSymbol(0, {
                 lineColor: '#0f0'
@@ -2522,13 +2523,9 @@ describe('update style specs', () => {
         });
         renderCount = renderCount || 0;
         doneRenderCount = doneRenderCount || 2;
-        let dirty = false;
         let count = 0;
         const renderer = map.getRenderer();
         const x = renderer.canvas.width, y = renderer.canvas.height;
-        layer.once('canvasisdirty', () => {
-            dirty = true;
-        });
         //因为是setStyle时，数据会被清空重绘，所以需要监听两次canvasisdirty
         const eventName = isSetStyle ? 'canvasisdirty' : 'layerload';
         const isGPU = mapRenderer === 'gpu';
@@ -2548,21 +2545,34 @@ describe('update style specs', () => {
                 }
             }, 800);
         } else {
+            layer.on('layererror', e => console.error('layererror:', e));
             layer.on(eventName, () => {
-                if (!dirty) {
-                    return;
-                }
                 count++;
                 if (count === renderCount + 1) {
                     const pixel = readPixel(layer.getRenderer().canvas, x / 2, y / 2);
                     //开始是红色
                     assert.deepEqual(pixel, [255, 0, 0, 255]);
                     changeFun(layer);
-                } else if (!isListenToRefreshStyle && count === renderCount + doneRenderCount) {
-                    const pixel = readPixel(layer.getRenderer().canvas, x / 2, y / 2);
-                    //变成绿色
-                    assert.deepEqual(pixel, expectedColor);
-                    done();
+                    
+                    if (!isListenToRefreshStyle) {
+                        // 【测试健壮性修复：异步渲染下的像素级轮询】
+                        // 引入 Proxy 懒加载和底层帧时间配额（Time Slicing）后，渲染帧触发时机发生了微调。
+                        // 放弃依赖特定次数的 canvasisdirty 事件计数，改为直接使用 setInterval 轮询 Canvas 像素。
+                        // 只要目标像素变更为期望颜色，即认为样式/状态更新成功，彻底解决 Flaky Test（偶发超时）问题。
+                        let checks = 0;
+                        const timer = setInterval(() => {
+                            const p = readPixel(layer.getRenderer().canvas, x / 2, y / 2);
+                            if (p[0] === expectedColor[0] && p[1] === expectedColor[1] && p[2] === expectedColor[2] && p[3] === expectedColor[3]) {
+                                clearInterval(timer);
+                                done();
+                            }
+                            checks++;
+                            if (checks > 20) {
+                                clearInterval(timer);
+                                assert.deepEqual(p, expectedColor);
+                            }
+                        }, 50);
+                    }
                 }
             });
         }

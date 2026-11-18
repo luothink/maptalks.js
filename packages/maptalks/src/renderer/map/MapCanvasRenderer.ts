@@ -33,7 +33,10 @@ class MapCanvasRenderer extends MapAbstractRenderer {
      */
     renderFrame(framestamp: number): boolean {
         this._updateMapStateCache();
-        this._updateMapCurrentViewGLInfo();
+        // 仅在视图变化或首帧时重算 GL 视图信息，避免每帧冗余计算
+        if (this.isViewChanged() || !this.map._currentViewGLInfo) {
+            this._updateMapCurrentViewGLInfo();
+        }
         const map = this.map;
         if (!map || !map.options['renderable']) {
             return false;
@@ -68,8 +71,8 @@ class MapCanvasRenderer extends MapAbstractRenderer {
         map._fireEvent('frameend');
         this._recordView();
         // refresh map's state
-        // It must be before events and frame callback, because map state may be changed in callbacks.
-        this._mapview = this._getMapView();
+        // Use snapshot to keep a stable copy for next frame's isViewChanged comparison
+        this._mapview = this._snapshotMapView();
         delete this._spatialRefChanged;
         this._fireLayerLoadEvents();
         this.executeFrameCallbacks();
@@ -239,6 +242,25 @@ class MapCanvasRenderer extends MapAbstractRenderer {
                 map.isMoving() && layer.options['forceRenderOnMoving'] ||
                 map.isRotating() && layer.options['forceRenderOnRotating'])
         ) {
+            // 交互降频：interactionFrameLimit > 1 时（如大数据量 GL 层），交互中每 N 帧才全量重绘一次，
+            // 跳过的帧复用旧 canvas 经视图变换（缩放矩阵/平移偏移）跟随画面，
+            // 避免每帧全量重绘大数据量图层导致的交互卡顿
+            const interactionFrameLimit = layer.options['interactionFrameLimit'];
+            if (interactionFrameLimit > 0 && layer !== map.getBaseLayer()) {
+                if (!renderer._interactionFrameCount) {
+                    renderer._interactionFrameCount = 0;
+                }
+                renderer._interactionFrameCount++;
+                if (renderer._interactionFrameCount % interactionFrameLimit !== 0) {
+                    if (map.isZooming() && !map.getPitch() && !map.isRotating()) {
+                        renderer.prepareRender();
+                        renderer.__zoomTransformMatrix = this._zoomMatrix;
+                    } else if (map.getPitch() || map.isRotating()) {
+                        renderer.clearCanvas();
+                    }
+                    return 0;
+                }
+            }
             // call drawOnInteracting to redraw the layer
             renderer.prepareRender();
             renderer.prepareCanvas();

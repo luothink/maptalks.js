@@ -18,6 +18,7 @@ import Browser from '../../core/Browser';
 import Size from '../../geo/Size';
 import Point from '../../geo/Point';
 import PointExtent from '../../geo/PointExtent';
+import GlobalConfig from '../../GlobalConfig';
 import TileConfig from './tileinfo/TileConfig';
 import TileSystem from './tileinfo/TileSystem';
 import Layer, { LayerJSONType, LayerOptionsType } from '../Layer';
@@ -89,6 +90,8 @@ class TileHashset {
  * @property             [options.debug=false]         - if set to true, tiles will have borders and a title of its coordinates.
  * @property              [options.renderer=gl]         - TileLayer's renderer, canvas or gl. gl tiles requires image CORS that canvas doesn't. canvas tiles can't pitch.
  * @property              [options.maxCacheSize=256]    - maximum number of tiles to cache
+ * @property              [options.dynamicCache=true]   - whether tile cache can auto-grow with visible tile count
+ *                                                          瓦片缓存是否可随可见瓦片数自动扩容
  * @property             [options.cascadeTiles=true]      - draw cascaded tiles of different zooms to reduce tiles
  * @property              [options.zoomOffset=0]           - offset from map's zoom to tile's zoom
  * @property              [options.tileRetryCount=0]       - retry count of tiles
@@ -115,7 +118,7 @@ const options: TileLayerOptionsType = {
 
     'background': true,
 
-    'loadingLimitOnInteracting': 3,
+    'loadingLimitOnInteracting': 16,
     'loadingLimit': 0,
 
     // 'tileRetryCount': 0,
@@ -139,6 +142,7 @@ const options: TileLayerOptionsType = {
     'spatialReference': null,
 
     'maxCacheSize': 256,
+    'dynamicCache': true,
 
     'renderer': (() => {
         return Browser.webgl ? 'gl' : 'canvas';
@@ -213,6 +217,8 @@ class TileLayer extends Layer {
     _visitedTiles: TileHashset;
     //@internal
     _zScale: number;
+    //@internal
+    _zScaleGLRes: number;
     //@internal
     _sr: SpatialReference;
     //@internal
@@ -755,9 +761,10 @@ class TileLayer extends Layer {
 
     //@internal
     _isTileInFrustum(node: TileNodeType, projectionView: Matrix4, glScale: number, offset: TileOffsetType): boolean {
-        if (!this._zScale) {
-            const map = this.getMap();
-            const glRes = map.getGLRes();
+        const map = this.getMap();
+        const glRes = map.getGLRes();
+        if (!this._zScale || this._zScaleGLRes !== glRes) {
+            this._zScaleGLRes = glRes;
             this._zScale = (map.altitudeToPoint(100, glRes) as any) / 100;
         }
         const renderer = this.getRenderer();
@@ -828,7 +835,29 @@ class TileLayer extends Layer {
         const map = this.getMap();
         const pitch = map.getPitch();
         const parentRenderer = parentLayer && parentLayer.getRenderer();
-        const mapExtent = map.getContainerExtent();
+        let mapExtent = map.getContainerExtent();
+        // Preload margin: expand viewport by tileSize * margin to
+        // prefetch tiles just outside the visible area. This eliminates white gaps
+        // during panning because newly-visible tiles are already loaded in cache.
+        // Only active during interaction (pan/zoom/rotate) to avoid inflating the
+        // loading count when the map is idle.
+        // 预加载边距：将视口按 tileSize × margin 扩展，
+        // 预取可视区域外侧的瓦片。这能消除平移时的白缝，
+        // 因为新进入视口的瓦片已在缓存中。
+        // 仅在交互（平移/缩放/旋转）期间生效，避免地图空闲时
+        // 膨胀加载计数。
+        const isInteracting = map.isInteracting && map.isInteracting();
+        const preloadMargin = isInteracting ? (GlobalConfig.preloadMarginTiles || 0) : 0;
+        if (preloadMargin > 0) {
+            const marginW = preloadMargin * this.getTileSize().width;
+            const marginH = preloadMargin * this.getTileSize().height;
+            mapExtent = new PointExtent(
+                Math.max(mapExtent.xmin - marginW, 0),
+                Math.max(mapExtent.ymin - marginH, 0),
+                mapExtent.xmax + marginW,
+                mapExtent.ymax + marginH
+            );
+        }
         const tileGrids = [];
         let count = 0;
         const minZoom = this.getMinZoom();
@@ -1499,8 +1528,10 @@ class TileLayer extends Layer {
 
         TILE_BOX[0][0] = (tileExtent.xmin - offset[0]) * glScale;
         TILE_BOX[0][1] = (tileExtent.ymin - offset[1]) * glScale;
+        TILE_BOX[0][2] = 0;
         TILE_BOX[1][0] = (tileExtent.xmax - offset[0]) * glScale;
         TILE_BOX[1][1] = (tileExtent.ymax - offset[1]) * glScale;
+        TILE_BOX[1][2] = 0;
         return intersectsBox(matrix, TILE_BOX);
     }
 
@@ -1509,8 +1540,10 @@ class TileLayer extends Layer {
         const map = this.getMap();
         TILE_BOX[0][0] = (tileExtent.xmin - offset[0]) * glScale;
         TILE_BOX[0][1] = (tileExtent.ymin - offset[1]) * glScale;
+        TILE_BOX[0][2] = 0;
         TILE_BOX[1][0] = (tileExtent.xmax - offset[0]) * glScale;
         TILE_BOX[1][1] = (tileExtent.ymax - offset[1]) * glScale;
+        TILE_BOX[1][2] = 0;
         return intersectsBox(map.projViewMatrix, TILE_BOX);
     }
 
@@ -1752,6 +1785,7 @@ export type TileLayerOptionsType = LayerOptionsType & {
     debug?: boolean;
     renderer?: 'gl' | 'canvas';
     maxCacheSize?: number;
+    dynamicCache?: boolean;
     cascadeTiles?: boolean;
     zoomOffset?: number;
     reloadErrorTileFunction?: (layer: TileLayer, renderer: TileLayerCanvasRenderer, tileInfo: Tile['info'], tileImage: Tile['image']) => void;

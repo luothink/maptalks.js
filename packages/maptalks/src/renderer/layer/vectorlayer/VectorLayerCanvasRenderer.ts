@@ -59,6 +59,8 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
     _displayExtent: Extent;
     //@internal
     _drawnRes: number;
+    //@internal
+    _progressiveBgTransform?: { scale: number; dx: number; dy: number };
 
     renderEnd: boolean;
     pageGeos: Geometries[];
@@ -69,7 +71,17 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
 
     setToRedraw(): this {
         super.setToRedraw();
-        this._resetProgressiveRender();
+        //总是重置渐进分页状态：每帧仅绘制 progressiveRenderCount 个几何，避免视图变化后一次同步全量
+        //绘制大数据量几何导致的单帧卡顿；若渐进已完成（renderEnd=true）且刚结束 zoom/pan，
+        //_resetProgressiveRender 会把旧完整画面按视图变换（缩放/平移）作为渐进首帧背景，
+        //画面无缝过渡，不会出现"重新绘制过程"从空白逐页出现的闪烁
+        //注意：仅在 layer 真正开启 progressiveRender 时才重置分页状态。
+        //未开启时（例如 Geometry.RemoveHide 等常规测试）若调用 _resetProgressiveRender，
+        //会在 layerload 监听尚未就位时清空 pageGeos/geoPainterList，并可能因
+        //_useCanvasAsProgressiveBg 拷贝旧画面导致测试断言失败。
+        if (this.isProgressiveRender()) {
+            this._resetProgressiveRender();
+        }
         return this;
     }
 
@@ -163,8 +175,16 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
             return true;
         }
         // don't redraw when map is zooming without pitch and layer doesn't have any point symbolizer.
-        if (map.isZooming() && !map.isRotating() && !map.getPitch() && !this._hasPoint && this.layer.constructor === VectorLayer) {
-            return false;
+        if (map.isZooming() && !map.isRotating() && !map.getPitch() && this.layer.constructor === VectorLayer) {
+            if (this.isProgressiveRender()) {
+                //progressive 首屏已完成：zoom 走矩阵变换（MapCanvasRenderer 用 _zoomMatrix 变换图层画布），
+                //避免交互帧重绘导致的逐页闪烁或全量重绘卡顿；zoom 结束后 view 变化会触发一次全量 render 重绘
+                if (this.renderEnd) {
+                    return false;
+                }
+            } else if (!this._hasPoint) {
+                return false;
+            }
         }
         return super.needToRedraw();
     }
@@ -203,6 +223,7 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
         if (!this._geosToDraw) {
             return;
         }
+        const drawStart = now();
         this._updateMapStateCache();
         this._updateDisplayExtent();
         const map = this.getMap();
@@ -217,6 +238,7 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
             if (!this._onlyHasPoint) {
                 this._checkGeos();
             }
+            this._batchConversionLines(this.rendererStateCache.glRes);
             this._drawnRes = res;
         }
         this._sortByDistanceToCamera(map.cameraPosition);
@@ -254,6 +276,10 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
         if (isDebug(this.layer)) {
             console.log('progressiveRender on drawOnInteracting page:', this.page);
         }
+        //如实上报本次交互帧的绘制耗时：交互路径不走 _tryToDraw/_drawAndRecord，_drawTime 会一直停留在旧值，
+        //使 MapCanvasRenderer 的 fpsOnInteracting 帧预算判断（inTime）恒为真，导致每帧都执行全量重绘、帧率崩溃。
+        //更新后，全量绘制开销大时下一帧会自动切换为矩阵变换路径，画面完整且交互流畅。
+        this._drawTime = now() - drawStart;
     }
 
     /**
@@ -281,6 +307,9 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
     }
 
     drawGeos() {
+        //渐进分页绘制：每帧仅绘制 progressiveRenderCount 个几何，保证大数据量下的每帧耗时可控。
+        //zoom/pan 结束后 setToRedraw 会重置分页状态，并以旧完整画面（经视图变换）为首帧背景，
+        //画面无缝过渡，既不卡顿也不闪烁
         this._drawSnapshot();
         this._updateMapStateCache();
         this._drawnRes = this.rendererStateCache.resolution;
@@ -290,6 +319,7 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
         if (!this._onlyHasPoint) {
             this._checkGeos();
         }
+        this._batchConversionLines(this.rendererStateCache.glRes);
         this._sortByDistanceToCamera(this.getMap().cameraPosition);
         this._collidesGeos();
         for (let i = 0, len = this._geosToDraw.length; i < len; i++) {
@@ -408,7 +438,21 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
 
     onZoomEnd(...args: any[]) {
         delete this.canvasExtent2D;
+        //记录 zoom 结束时的视图变换，渐进重绘以旧画面缩放为背景，画面无缝过渡
+        const t = this._calcProgressiveBgTransform();
+        if (t) {
+            this._progressiveBgTransform = t;
+        }
         super.onZoomEnd.apply(this, args);
+    }
+
+    onMoveEnd(...args: any[]) {
+        //记录 pan 结束时的视图变换，渐进重绘以旧画面平移为背景，画面无缝过渡
+        const t = this._calcProgressiveBgTransform();
+        if (t) {
+            this._progressiveBgTransform = t;
+        }
+        super.onMoveEnd.apply(this, args);
     }
 
     onRemove() {
@@ -571,6 +615,79 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
         return pts;
     }
 
+    /**
+     * 线/面的批量坐标转换优化
+     * 将当前需要渲染的线/面的投影点一次性通过 map._pointsAtResToContainerPoints 转换为容器坐标，
+     * 转换结果写入各几何投影点的 _pt 缓存，Painter 绘制时可直接复用，避免逐几何重复转换。
+     * 与 _batchConversionMarkers 的点批量转换相互补充。
+     * @internal
+     * @param glRes
+     */
+    _batchConversionLines(glRes: number) {
+        if (this._onlyHasPoint || !this._constructorIsThis()) {
+            return;
+        }
+        const map = this.getMap();
+        if (!map) {
+            return;
+        }
+        const rendererStateCache = this.rendererStateCache;
+        if (!rendererStateCache) {
+            return;
+        }
+        // 只对可见（_geosToDraw）的线/面做批量转换
+        const geos = this._geosToDraw;
+        if (!geos || !geos.length) {
+            return;
+        }
+        // 收集线/面的投影点（painter 已按当前分辨率缓存，直接复用）
+        const allPts = [];
+        const batches = [];
+        for (let i = 0, len = geos.length; i < len; i++) {
+            const geo = geos[i];
+            if (geo.isPoint) {
+                continue;
+            }
+            const painter = geo._painter;
+            if (!painter) {
+                continue;
+            }
+            // 集合几何（MultiLineString/MultiPolygon/GeometryCollection 等）使用 CollectionPainter，
+            // 它没有 getProjectionPoints 方法，跳过批量转换，走各自子 painter 的常规绘制路径
+            if (typeof painter.getProjectionPoints !== 'function') {
+                continue;
+            }
+            const points = painter.getProjectionPoints();
+            if (!points || !Array.isArray(points)) {
+                continue;
+            }
+            // 带洞多边形等复合几何（points[0] 为数组）跳过批量转换
+            if (Array.isArray(points[0])) {
+                continue;
+            }
+            const start = allPts.length;
+            for (let j = 0, l = points.length; j < l; j++) {
+                allPts[start + j] = points[j];
+            }
+            batches.push({ painter, points, start });
+        }
+        if (!allPts.length) {
+            return;
+        }
+        const resultPts = getPointsResultPts(allPts, '_pt');
+        // _pointsAtResToContainerPoints 就地填充并返回 resultPts，返回值无需再赋值
+        map._pointsAtResToContainerPoints(allPts, glRes, null, resultPts);
+        for (let i = 0, len = batches.length; i < len; i++) {
+            const batch = batches[i];
+            const painter = batch.painter;
+            painter._batchApplied = true;
+            painter._batchGlRes = glRes;
+            painter._batchPitch = rendererStateCache.pitch;
+            painter._batchBearing = rendererStateCache.bearing;
+            painter._batchOffset = rendererStateCache.offset;
+        }
+    }
+
     //@internal
     _sortByDistanceToCamera(cameraPosition: Vector3) {
         if (!this.layer.options['sortByDistanceToCamera']) {
@@ -677,9 +794,6 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
         if (!this.isProgressiveRender()) {
             return geos;
         }
-        // if (this.renderEnd) {
-        //     return [];
-        // }
         const layer = this.layer;
         const { progressiveRenderCount } = layer.options;
         const pageSize = progressiveRenderCount;
@@ -698,12 +812,65 @@ class VectorLayerRenderer extends OverlayLayerCanvasRenderer {
         if (isDebug(this.layer)) {
             console.log('progressiveRender resetProgressiveRender');
         }
+        const lastRenderEnd = this.renderEnd;
         this.renderEnd = false;
         this.page = 1;
         this.pageGeos = [];
         this.geoPainterList = [];
         this.maxTolerance = 0;
-        this._clearSnapshotCanvas();
+        if (lastRenderEnd && this._progressiveBgTransform) {
+            //渐进首屏已完成且刚结束 zoom/pan：把旧完整画面按视图变换（缩放+平移）绘制为渐进首帧背景，
+            //画面从旧视图无缝过渡到新视图，避免"重新绘制过程"从空白逐页出现的闪烁；
+            //随后仍按页渐进覆盖新几何，每帧只画 progressiveRenderCount 个，交互结束不卡顿
+            const t = this._progressiveBgTransform;
+            delete this._progressiveBgTransform;
+            this._useCanvasAsProgressiveBg(t.scale, t.dx, t.dy);
+        } else {
+            //首屏渐进中或数据变化：不需要旧画面背景，清空快照从空白开始分页绘制
+            delete this._progressiveBgTransform;
+            this._clearSnapshotCanvas();
+        }
+    }
+
+    //@internal
+    _useCanvasAsProgressiveBg(scale: number, dx: number, dy: number) {
+        const snapshotCanvas = this._checkSnapshotCanvas();
+        if (!snapshotCanvas || !this.canvas) {
+            return;
+        }
+        const ctx = clearCanvas(snapshotCanvas);
+        const w = snapshotCanvas.width;
+        const h = snapshotCanvas.height;
+        //zoom：绕画布中心缩放（newRes/_drawnRes）；pan：按视图中心偏移平移
+        ctx.save();
+        ctx.translate(w / 2 + dx, h / 2 + dy);
+        ctx.scale(scale, scale);
+        ctx.translate(-w / 2, -h / 2);
+        ctx.drawImage(this.canvas, 0, 0);
+        ctx.restore();
+    }
+
+    //@internal
+    _calcProgressiveBgTransform(): { scale: number; dx: number; dy: number } {
+        if (!this.isProgressiveRender() || !this.canvas) {
+            return null;
+        }
+        const map = this.getMap();
+        if (!map) {
+            return null;
+        }
+        const oldRes = this._drawnRes;
+        const newRes = map.getResolution();
+        const scale = oldRes && newRes && oldRes !== newRes ? newRes / oldRes : 1;
+        //zoom/pan 结束后视图中心相对画布中心的容器偏移（换算为位图像素），pan 时旧画面据此平移对齐
+        const cur = map._pointToContainerPoint(map.getCenter());
+        const dpr = this.mapDPR || map.getDevicePixelRatio() || 1;
+        const dx = (cur.x - map.width / 2) * dpr;
+        const dy = (cur.y - map.height / 2) * dpr;
+        if (scale === 1 && dx === 0 && dy === 0) {
+            return null;
+        }
+        return { scale, dx, dy };
     }
 
     //@internal

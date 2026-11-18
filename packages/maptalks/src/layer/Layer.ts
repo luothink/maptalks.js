@@ -935,6 +935,12 @@ export type LayerOptionsType = {
     forceRenderOnMoving?: boolean,
     forceRenderOnZooming?: boolean,
     forceRenderOnRotating?: boolean,
+    /**
+     * 交互期间的重绘降频因子：>1 时（如 2）交互中每 N 帧才全量重绘一次该图层，
+     * 跳过的帧复用旧 canvas 并经视图变换（缩放矩阵/平移偏移）跟随画面。
+     * 适用于大数据量 GL 层等单帧渲染开销大的图层，显著降低交互卡顿。
+     */
+    interactionFrameLimit?: number,
     collision?: boolean,
     collisionScope?: 'layer' | 'map',
     hitDetect?: boolean,

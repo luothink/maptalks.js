@@ -118,6 +118,17 @@ export default class Dispatcher {
         }
     }
 
+    // Lazy property fetch for features:'id' mode.
+    // The worker stores property snapshots and sends them back on demand.
+    getFeatureProperties({ mapId, layerId, params }, callback) {
+        const layer = this._getLayerById(mapId, layerId);
+        if (layer) {
+            layer.getFeatureProperties(params, callback);
+        } else {
+            callback(null, {});
+        }
+    }
+
     /**
      * Receive response from main thread and call callback
      * @param {Object} data

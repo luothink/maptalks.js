@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "clean": "rimraf dist",
-    "lint": "eslint src/**/*.js test/**/*.js",
+    "lint": "eslint \"src/**/*.js\" \"test/**/*.js\"",
     "dev": "rollup -w -c build/rollup.config.js",
     "build": "npm run clean && npm run lint && rollup --environment BUILD:production -c build/rollup.config.js",
     "build-dev": "rollup -c build/rollup.config.js",
@@ -51,6 +51,7 @@
   "devDependencies": {
     "@maptalks/gl": "workspace:*",
     "@maptalks/gpu": "workspace:*",
+    "@maptalks/regl": "^3.6.0",
     "@maptalks/rollup-plugin-glsl-minify": "^0.1.7",
     "@rollup/plugin-commonjs": "^25.0.7",
     "@rollup/plugin-json": "^6.1.0",

@@ -18,12 +18,15 @@
     void main() {
         vec2 uv = aTexCoord;
         uv.y = 1.0 - uv.y;
-        vec4 encodedHeight = texture2D(flatMask, uv);
         float altitude = aPosition.z;
+        #ifdef HAS_MASK_EXTENT
+        // 只有设置了 mask 时才需要逐顶点采样/解码 flatMask，无 mask 时跳过
+        vec4 encodedHeight = texture2D(flatMask, uv);
         if (length(encodedHeight) < 2.0) {
             float maskHeight = decodeFloat32(encodedHeight);
             altitude = min(aPosition.z, maskHeight);
         }
+        #endif
         vec4 position = vec4(aPosition.xy, (altitude + minAltitude), 1.0);
         position = positionMatrix * position;
         #ifdef HAS_MASK_EXTENT

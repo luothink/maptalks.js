@@ -4,6 +4,13 @@ import { mat4, quat} from 'gl-matrix';
 import earcut from 'earcut';
 import { coordinateToWorld, normalizeColor, isNumber } from "../util/util";
 
+// 各掩膜模式的写入值（经 maskModeExtent.frag 写入 RGBA8 纹理的 R 通道，着色器读回后做模式判断）。
+// 注意：0.1 / 0.3 / 0.7 × 255 = 25.5 / 76.5 / 178.5 为进位临界值，不同 GPU 舍入方向不同
+// （Windows 多向下舍入、Mac Metal 向上舍入），读回时会产生 ±1/255 的量化误差。
+// 着色器侧（reshader/shaderlib/glsl/mask.frag、glsl/mask.vert、wgsl/mask.ts）的
+// 模式判断边界常量已取相邻模式值的中点（±0.05）以容忍该误差
+// （曾导致 clip-inside 挖方分析在 Mac 上静默失效的 bug 即源于此）。
+// 若修改此处的模式值，务必同步修改上述着色器中的边界常量！
 const MASK_MODES = {
     'clip-inside': 0.1, 'clip-outside': 0.2, 'flat-inside': 0.3, 'flat-outside': 0.4, 'color': 0.5, 'texture': 0.6, 'elevate': 0.7
 };

@@ -1,16 +1,19 @@
 /* eslint-disable @typescript-eslint/ban-types */
-import { isFunction } from '../util/common.js';
-import { getWorkerPool, pushAdapterCreated } from './CoreWorkers.js';
+import { isFunction } from "../util/common.js";
+import { getWorkerPool, pushAdapterCreated } from "./CoreWorkers.js";
 
-type AdapterFunction = (exports: {
-    initialize: Function
-    onmessage: (message: any, postResponse: Function) => void
-}, global: any) => void
+type AdapterFunction = (
+    exports: {
+        initialize: Function;
+        onmessage: (message: any, postResponse: Function) => void;
+    },
+    global: any,
+) => void;
 
-type Adapter = string | AdapterFunction
+type Adapter = string | AdapterFunction;
 
 let adapters: {
-    [key: string]: Adapter
+    [key: string]: Adapter;
 } = {};
 /**
  * Register a worker adapter
@@ -98,6 +101,28 @@ const header = `
     }
 
     var messageResultQueue = [];
+    var queuedBytes = 0;
+    // 大消息如果继续等待 idle 批量冲刷，会在 worker 侧形成明显的 ArrayBuffer 堆积，
+    // 导致子线程长期维持高内存占用，因此直接发送给主线程。
+    var DIRECT_POST_THRESHOLD = 2 * 1024 * 1024;
+    // 小消息仍然允许合批，但要限制总排队体积，避免主线程忙时无限积压。
+    var MAX_QUEUED_BYTES = 16 * 1024 * 1024;
+
+    function estimateTransferBytes(buffers, data) {
+        var bytes = 0;
+        if (buffers && buffers.length) {
+            for (var i = 0; i < buffers.length; i++) {
+                if (buffers[i] && buffers[i].byteLength) {
+                    bytes += buffers[i].byteLength;
+                }
+            }
+            return bytes;
+        }
+        if (data && data.byteLength) {
+            return data.byteLength;
+        }
+        return bytes;
+    }
 
     function handleMessageQueue(messageRatio){
        if(messageResultQueue.length===0){
@@ -107,7 +132,11 @@ const header = `
        var queues = messageResultQueue.slice(0, count);
        queues.forEach(function(queue){
           post(queue.callback,queue.err,queue.data,queue.buffers);
+          queuedBytes -= queue.bytes || 0;
        });
+       if(queuedBytes < 0){
+          queuedBytes = 0;
+       }
        messageResultQueue=messageResultQueue.slice(count, Infinity);
     }
 
@@ -128,12 +157,34 @@ const header = `
     }
 
     function joinQueue(callback,err,data,buffers){
+        var bytes = estimateTransferBytes(buffers, data);
+        if (bytes >= DIRECT_POST_THRESHOLD) {
+            // 大 payload 直接出队，避免 idle 调度变成 buffer 的滞留点。
+            post(callback, err, data, buffers);
+            return;
+        }
+        // ImageBitmap 是 transferable 对象且没有 byteLength（恒被估算为 0 字节），
+        // 若走 messageResultQueue，会被 idle 消息按 ~30%/帧 的比例节流回传，
+        // 瓦片解码结果会长时间滞留在 worker 端：既放大了上屏延迟（白块），
+        // 又在 worker 端持续堆积位图内存（且不受 MAX_QUEUED_BYTES 限制）。
+        // 瓦片位图直接发回主线程，同时转移所有权，消除滞留与堆积。
+        if (data && typeof data === 'object' && typeof data.close === 'function' &&
+            typeof data.width === 'number' && typeof data.height === 'number') {
+            post(callback, err, data, buffers);
+            return;
+        }
+        if (queuedBytes + bytes > MAX_QUEUED_BYTES) {
+            // 队列体积达到上限时优先清空一轮，避免 worker 端持续扩容。
+            handleMessageQueue(1);
+        }
         messageResultQueue.push({
             callback:callback,
             err:err,
             data:data,
-            buffers:buffers
+            buffers:buffers,
+            bytes:bytes
         });
+        queuedBytes += bytes;
     }
 
     function wrap(callback) {
@@ -168,7 +219,6 @@ function compileWorkerSource() {
         source += `
     workerExports.initialize && workerExports.initialize(self);
         `;
-
     }
     source += footer;
     return source;
@@ -177,12 +227,14 @@ function compileWorkerSource() {
 let url: string;
 
 export function getWorkerSourcePath() {
-    if (typeof window === 'undefined') {
+    if (typeof window === "undefined") {
         return null;
     }
     if (!url) {
         const source = compileWorkerSource();
-        url = window.URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+        url = window.URL.createObjectURL(
+            new Blob([source], { type: "text/javascript" }),
+        );
         //clear cached worker adapters
         adapters = {};
     }
@@ -213,7 +265,7 @@ export function createAdapter(key: string, cb: Function) {
     }
     const workers = workerPool.workers || [];
     if (workers.length === 0) {
-        console.error('workerpool workers count is 0');
+        console.error("workerpool workers count is 0");
     }
     let count = 0;
     const messageCB = (msg: any) => {
@@ -221,8 +273,8 @@ export function createAdapter(key: string, cb: Function) {
         if (msg.adapterName === key) {
             count++;
             if (count === workers.length) {
-                workers.forEach(worker => {
-                    worker.removeEventListener('message', messageCB);
+                workers.forEach((worker) => {
+                    worker.removeEventListener("message", messageCB);
                 });
                 delete adapters[key];
                 cb();
@@ -230,8 +282,11 @@ export function createAdapter(key: string, cb: Function) {
         }
     };
     workers.forEach((worker: Worker) => {
-        worker.addEventListener('message', messageCB);
-        worker.postMessage({ key, code: adapter, messageType: 'createAdapter' });
+        worker.addEventListener("message", messageCB);
+        worker.postMessage({
+            key,
+            code: adapter,
+            messageType: "createAdapter",
+        });
     });
-
 }

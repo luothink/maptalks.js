@@ -1,3 +1,4 @@
+/** @typedef {import('@maptalks/regl')} */
 import * as maptalks from 'maptalks';
 import { reshader, vec4, getWGSLSource } from '@maptalks/gl';
 import collisionVert from './glsl/collision.vert';
@@ -208,6 +209,32 @@ export default class CollisionPainter extends BasicPainter {
         if (isEnableUniquePlacement && this._isReplacedPlacement(meshKey, boxIndex)) {
             return false;
         }
+        // 缩放期间隐藏背景瓦片文字碰撞盒，
+        // 防止不同缩放级别间文字重叠。背景瓦片的几何遮挡仍由 shader 中的
+        // _bgOpacityFactor 控制透明度过，但文字标注应完全隐藏。
+        // zoom 结束后的渐隐宽限期（_zoomEndMeshes 非空）内背景瓦片文字 mesh 仍在
+        // fade-out 中，同样需要隐藏，否则会与当前瓦片文字重叠。
+        if (!isForeground) {
+            // - 背景瓦片文字（含 POI 文字，geometry.properties.textPlacement 存在）：
+            //   在瓦片仍是背景期间始终隐藏，避免 fade-out 宽限期结束后（_lastBackgroundTileOpacity
+            //   回到 1，_bgOpacityFactor 不再降低透明度）残留显示与当前瓦片文字重叠。
+            // - 背景瓦片纯点/图标（marker，无 textPlacement）：仅在 zoom 过渡期（_zooming）与
+            //   fade-out 宽限期（_zoomEndMeshes）强制隐藏，过渡结束后由碰撞检测（前景优先）
+            //   天然去重。不能对这些 mesh 执行 scene.removeMesh，否则瓦片重新变前景时
+            //   点数据无法恢复 → 漏渲染。
+            const subMeshes = mesh.meshes ? mesh.meshes : [mesh];
+            let isBackgroundText = false;
+            for (let k = 0; k < subMeshes.length; k++) {
+                const subGeo = subMeshes[k] && subMeshes[k].geometry && subMeshes[k].geometry.properties;
+                if (subGeo && subGeo.textPlacement) {
+                    isBackgroundText = true;
+                    break;
+                }
+            }
+            if (isBackgroundText || this._zooming || this._zoomEndMeshes && this._zoomEndMeshes.length) {
+                return false;
+            }
+        }
         const l = meshBoxes.length;
         // if (this.shouldIgnoreBackground() && !isForeground) {
         //     return INVISIBLE_BOX;
@@ -282,13 +309,18 @@ export default class CollisionPainter extends BasicPainter {
                 }
             }
         }
-        let visible = boxVisible && collision && collision.collides === 0;
+        // 交互中碰撞检测受 collisionFrameLimit（默认 1.5ms）时间片限制，未被检测到的新 box（无缓存）
+        // 不能直接隐藏，否则新瓦片中的点/标注会漏渲染（如两个重叠的点同时消失）。
+        // 无缓存时默认可见，后续帧完成碰撞检测后再隐藏冲突项。
+        let visible = boxVisible && (collision ? collision.collides === 0 : true);
 
 
         let fadingOpacity = 1;
         let isFading = false;
         if (this.sceneConfig.fading) {
             const stamps = this._getBoxTimestamps(mesh);
+            const map = this.getMap();
+            const isInteracting = map && map.isInteracting && map.isInteracting();
             // const current = stamps[boxIndex];
             // if (getLabelContent(mesh, allElements[start]) === '汉阳大道') {
             //     // console.log('湖北', isForeground, collision && collision.collides, stamps[boxIndex]);
@@ -300,7 +332,7 @@ export default class CollisionPainter extends BasicPainter {
             // }
             //zoomingOut过程中，直接根据collides结果显示或隐藏，不fading，避免fading造成的聚团现象
             //不能用this._zooming判断，因为zooming没有延迟
-            if (!this._zoomingOut) {
+            if (!this._zoomingOut && !isInteracting) {
                 if (isForeground) {
                     delete mesh._fadeOutStartTime;
                 }
@@ -340,6 +372,9 @@ export default class CollisionPainter extends BasicPainter {
                 }
 
             } else {
+                if (isForeground) {
+                    delete mesh._fadeOutStartTime;
+                }
                 stamps[boxIndex] = visible ? 1 : -1;
             }
         }
@@ -596,14 +631,17 @@ export default class CollisionPainter extends BasicPainter {
         }
         if (Array.isArray(meshes)) {
             for (let i = 0; i < meshes.length; i++) {
-                const key = meshes[i].properties.meshKey;
+                const key = meshes[i] && meshes[i].properties && meshes[i].properties.meshKey;
+                if (!key) continue;
                 if (this._collisionContext) delete this._collisionContext.tags[key];
                 if (this._boxTimestamps) delete this._boxTimestamps[key];
             }
         } else {
-            const key = meshes.properties.meshKey;
-            if (this._collisionContext) delete this._collisionContext.tags[key];
-            if (this._boxTimestamps) delete this._boxTimestamps[key];
+            const key = meshes && meshes.properties && meshes.properties.meshKey;
+            if (key) {
+                if (this._collisionContext) delete this._collisionContext.tags[key];
+                if (this._boxTimestamps) delete this._boxTimestamps[key];
+            }
         }
         super.deleteMesh(meshes, keepGeometry);
     }
@@ -718,25 +756,45 @@ export default class CollisionPainter extends BasicPainter {
         super.updateCollision(context);
         this._startCollision();
         this._prepareZoomEndMeshes();
+        const map = this.getMap();
+        const isInteracting = map && map.isInteracting && map.isInteracting();
         if (this._zoomEndMeshes && this._zoomEndMeshes.length) {
             this._updateZoomMeshesLevel();
             if (this._zoomEndMeshes) {
-                this.setToRedraw();
+                // 交互过程中地图本身已经在持续出帧，这里不再额外强推 redraw，
+                // 避免 text/icon 的碰撞过渡继续放大帧压力。
+                if (!isInteracting) {
+                    this.setToRedraw();
+                }
                 this.scene.addMesh(this._zoomEndMeshes);
             }
         }
         //text/icon在同一个位置如果内容相同，只显示一个
-        const map = this.getMap();
-        if (map.isZooming() || this._zoomEndMeshes && this._zoomEndMeshes.length) {
+        // 背景瓦片（缩放时注入的旧 zoom 瓦片）存在期间也要持续执行去重：
+        // 否则缩放结束后 zoomEndMeshes 渐隐完成被清空、merge 停止，
+        // 而宽限期内背景瓦片仍在绘制，新旧 zoom 瓦片的同名/同位 label
+        // 会同时显示（重叠），直到背景瓦片被 retire 后才恢复正常。
+        const sceneMeshes = this.scene.getMeshes();
+        const renderer = this.layer.getRenderer();
+        let hasBackTileMeshes = false;
+        for (let i = 0; i < sceneMeshes.length; i++) {
+            const m = sceneMeshes[i];
+            if (m && m.properties && m.properties.tile && renderer.isBackTile(m.properties.tile.id)) {
+                hasBackTileMeshes = true;
+                break;
+            }
+        }
+        if (map.isZooming() || this._zoomEndMeshes && this._zoomEndMeshes.length || hasBackTileMeshes) {
             this._updateUniquePlacements();
-            this._mergeUniquePlacements(this.scene.getMeshes());
+            this._mergeUniquePlacements(sceneMeshes);
         }
     }
 
     paint(context) {
         const status = super.paint(context);
         this._renderCollisionBox(context);
-        if (this._canProceed === false) {
+        const map = this.getMap();
+        if (this._canProceed === false && (!map || !map.isInteracting || !map.isInteracting())) {
             this.setToRedraw();
         }
         return status;
@@ -777,7 +835,7 @@ export default class CollisionPainter extends BasicPainter {
             //记录zoom结束的时间戳
             const renderer = this.layer.getRenderer();
             // linePlacement的mesh不放到zoomEndMeshes中
-            this._zoomEndMeshes = this.scene.getMeshes().filter(m => !renderer.isForeground(m) && !m.properties.isLinePlacement);
+            this._zoomEndMeshes = this.scene.getMeshes().filter(m => m && m.properties && !renderer.isForeground(m) && !m.properties.isLinePlacement);
         } else if (zooming && !this._zooming) {
             this._preRes = map.getResolution();
         }
@@ -894,6 +952,10 @@ export default class CollisionPainter extends BasicPainter {
         const meshes = [];
         for (let i = 0; i < this._zoomEndMeshes.length; i++) {
             const mesh = this._zoomEndMeshes[i];
+            // 跳过已经被 dispose 的 mesh（LRU 淘汰会清空 properties）
+            if (!mesh || !mesh.properties) {
+                continue;
+            }
             const tileInfo = mesh.properties.tile;
             if (!mesh._fadeOutStartTime && renderer.isBackTile(tileInfo.id)) {
                 mesh._fadeOutStartTime = timestamp;
@@ -901,10 +963,16 @@ export default class CollisionPainter extends BasicPainter {
             //需要更新zoom meshes 的level，让他们改为在background阶段绘制
             const level = (tileInfo.z - tileZoom) > 0 ? 2 * (tileInfo.z - tileZoom) - 1 : 2 * (tileZoom - tileInfo.z);
             mesh.properties.level = level;
-            if (renderer.isForeground(mesh) ||
-                mesh._fadeOutStartTime && (timestamp - mesh._fadeOutStartTime > fadeOutDelay + fadingDuration)) {
+            if (renderer.isForeground(mesh)) {
                 delete mesh._fadeOutStartTime;
-                // console.log(timestamp, 'removed');
+                continue;
+            }
+            if (mesh._fadeOutStartTime && (timestamp - mesh._fadeOutStartTime > fadeOutDelay + fadingDuration)) {
+                // 渐隐完成：仅从 _zoomEndMeshes 中移除，mesh 保留在 scene 中，
+                // 由瓦片 retire 时正常清理。不能调用 scene.removeMesh 永久移除 mesh：
+                // 瓦片数据复用（LRU）时不会重新创建 mesh，若瓦片随后重新变为前景
+                // （再次缩放回来），点/图标/文字 mesh 无法恢复 → 漏渲染。
+                delete mesh._fadeOutStartTime;
                 continue;
             }
             meshes.push(mesh);
@@ -975,10 +1043,25 @@ export default class CollisionPainter extends BasicPainter {
         const map = this.getMap();
         const cache = maptalks.MapStateCache[map.id];
         const zoom = cache ? cache.zoom : map.getZoom();
-        let changed = !this._mergedMeshes || this._mergedMehesZoom !== zoom;
+        const scale = map.getGLScale();
+        // crossTileSymbolIndex：当 zoom 状态（isZooming）或背景瓦片
+        // fade 状态变化时，必须重新执行去重合并，否则 _replacedPlacements 缓存过时。
+        // 典型场景：zoom 结束但 zoom 值为同一整数 → zoom/scale 不变 → changed=false
+        // → stale 缓存 → 背景文字应该显示却被隐藏（或反之）。
+        const renderer = this.layer && this.layer.getRenderer();
+        const isZooming = map.isZooming();
+        const bgOpacity = renderer && renderer._lastBackgroundTileOpacity;
+        const isFading = bgOpacity !== undefined && bgOpacity < 1;
+        // zoom 结束后的渐隐宽限期（_zoomEndMeshes 非空）同样视为"过渡状态"，
+        // 此期间背景瓦片文字必须全部隐藏，避免与当前瓦片文字重叠。
+        const hasZoomEndMeshes = !!(this._zoomEndMeshes && this._zoomEndMeshes.length);
+        const zoomStateChanged = this._wasZooming !== isZooming || this._wasFadingBg !== isFading || this._wasZoomEndMeshes !== hasZoomEndMeshes;
+
+        let changed = !this._mergedMeshes || this._mergedMehesZoom !== zoom || this._mergedScale !== scale || zoomStateChanged;
         if (!changed) {
             for (let i = 0; i < meshes.length; i++) {
-                if (!this._mergedMeshes[meshes[i].properties.meshKey]) {
+                const meshKey = meshes[i] && meshes[i].properties && meshes[i].properties.meshKey;
+                if (!this._mergedMeshes[meshKey]) {
                     changed = true;
                     break;
                 }
@@ -988,10 +1071,13 @@ export default class CollisionPainter extends BasicPainter {
             return;
         }
         this._mergedMehesZoom = zoom;
+        this._mergedScale = scale;
+        this._wasZooming = isZooming;
+        this._wasFadingBg = isFading;
+        this._wasZoomEndMeshes = hasZoomEndMeshes;
         this._replacedPlacements = {};
         this._mergedMeshes = {};
         meshes = meshes.sort(sortByLevel);
-        const scale = this.getMap().getGLScale();
         const allPlacements = {};
         // let hubeiKey;
         // const keys = [];
@@ -1001,11 +1087,54 @@ export default class CollisionPainter extends BasicPainter {
                 //disposed
                 continue;
             }
-            const { meshKey } = mesh.properties;
+            const { meshKey, isForeground } = mesh.properties;
             this._mergedMeshes[meshKey] = 1;
             const { uniquePlacements } = mesh.geometry.properties;
             if (!uniquePlacements) {
                 continue;
+            }
+            // 关键修复：unique key 基于 world coord 计算（[floor(worldX), floor(worldY), codeSum]），
+            // 但不同 zoom 的同一地物 world coord 差很多（tile grid 错位），
+            // 导致 background 文字 mesh 和 current 文字 mesh 的 uKey 几乎不匹配，
+            // merge 替换失败 → 中心区域 background + current 两套文字同时显示 → 严重重叠。
+            // 使用渐进式隐藏策略：背景 opacity 越低，隐藏的背景 placements 越多。
+            // cross-fade：zoom 期间 + fade-in 尾帧期间完全隐藏背景瓦片文字，
+            // 避免与当前瓦片文字重叠。线/面由下层 GL shader（_bgOpacityFactor）控制透明度渐隐。
+            if (!isForeground) {
+                const renderer = this.layer.getRenderer();
+                const map = renderer.getMap();
+                // crossTileSymbolIndex 机制：
+                // zoom 过渡中背景瓦片的文字/图标会和当前瓦片文字重叠，
+                // 造成严重的"重影"效果。通过 crossTileSymbolIndex
+                // 完全隐藏背景瓦片符号，只显示当前瓦片符号。
+                //
+                // 同时检查 isZooming（覆盖第一帧，此时 _lastBackgroundTileOpacity 可能仍为 1）
+                // 和 _lastBackgroundTileOpacity < 1（覆盖 fade-in 尾帧）
+                const isZooming = map && map.isZooming && map.isZooming();
+                const bgOpacity = renderer._lastBackgroundTileOpacity;
+                const isFading = bgOpacity !== undefined && bgOpacity < 1;
+                // zoom 结束后的渐隐宽限期（_zoomEndMeshes 非空）内，_lastBackgroundTileOpacity
+                // 可能已回到 1（背景瓦片 fade-in 完成）导致 isFading 失效，此时背景瓦片文字
+                // mesh 仍在 fade-out 中，若不隐藏会与当前瓦片文字重叠。
+                const hasZoomEndMeshes = !!(this._zoomEndMeshes && this._zoomEndMeshes.length);
+                // 背景瓦片文字（geometry.properties.textPlacement 存在）在瓦片仍是背景期间
+                // 始终 replaced 隐藏：即使 fade-out
+                // 宽限期结束、_lastBackgroundTileOpacity 回到 1，背景文字也不显示，
+                // 避免与当前瓦片文字重叠。
+                // 背景瓦片纯点/图标（无 textPlacement）仅在过渡期隐藏，过渡结束后由
+                // 碰撞检测（前景优先）天然去重，不依赖 removeMesh，防止漏渲染。
+                const bgGeoProps = mesh.geometry && mesh.geometry.properties;
+                const isBackgroundText = bgGeoProps && bgGeoProps.textPlacement;
+                if (isBackgroundText || isZooming || isFading || hasZoomEndMeshes) {
+                    this._replacedPlacements[meshKey] = this._replacedPlacements[meshKey] || {};
+                    for (let j = 0; j < uniquePlacements.length; j++) {
+                        if (!uniquePlacements[j]) {
+                            continue;
+                        }
+                        this._replacedPlacements[meshKey][uniquePlacements[j].index] = 1;
+                    }
+                    continue;
+                }
             }
             for (let j = 0; j < uniquePlacements.length; j++) {
                 if (!uniquePlacements[j]) {
@@ -1169,6 +1298,10 @@ function getUniqueKey(key, scale) {
 }
 
 function sortByLevel(m0, m1) {
+    // 防御：tile 被 LRU 淘汰或数据刷新时 mesh 可能已 dispose（properties 被置 null）
+    if (!m0 || !m0.properties || !m1 || !m1.properties) {
+        return 0;
+    }
     const r = m1.properties['level'] - m0.properties['level'];
     if (r === 0) {
         return m0.properties.meshKey - m1.properties.meshKey;

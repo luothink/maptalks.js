@@ -336,7 +336,13 @@ function convertUrl(data, urlModifier) {
 type OmitUrlTemplate = Omit<VectorTileLayerOptionsType, 'urlTemplate'>;
 
 type OptionsType = {
-    features?: string,
+    /**
+     * GeoJSONVectorTileLayer feature payload mode.
+     * - true: keep worker feature objects for interaction, no extra full JSON copy.
+     * - 'id': prefer ids in worker payload and hydrate feature details from the main-thread GeoJSON id map.
+     * - 'full': request an additional full feature JSON payload from worker.
+     */
+    features?: boolean | "id" | "full" | "transient",
     tileBuffer?: number,
     extent?: number,
     pyramidMode?: 1,

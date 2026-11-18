@@ -369,7 +369,15 @@ function evaluateAndUpdate(arr, feature, evaluate, start, end, len, valueIndex, 
         }
     }
 
-    const value = evaluate(properties, geometry, arr, start * len);
+    let value;
+    try {
+        value = evaluate(properties, geometry, arr, start * len);
+    } catch (e) {
+        console.error('evaluate error:', e);
+    }
+    if (valueIndex === 0) { // Just to not spam
+       //  console.log('evaluate value is:', value);
+    }
     if (Array.isArray(value)) {
         let dirty = false;
         for (let ii = 0; ii < len; ii++) {

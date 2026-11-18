@@ -156,20 +156,32 @@ class ShadowProcess {
         const texSize = this._texSize = this._texSize || [];
         texSize[0] = canvas.width;
         texSize[1] = canvas.height;
-        //display ground shadows
-        this.renderer.render(this._shadowDisplayShader, {
+        // 复用 uniforms 对象引用：Renderer.render 在 shader.context === uniforms 时会跳过 setUniforms 调用，
+        // 降低每帧的 CPU 开销与 GC 压力。mat4 数组是 ShadowProcess 实例持有的稳定引用，值被就地更新后会被 shader 自动读取到。
+        const uniforms = this._shadowDisplayUniforms || (this._shadowDisplayUniforms = {
             'halton': halton || EMPTY_HALTON,
             'globalTexSize': texSize,
             'projMatrix': this._projMatrix,
             'viewMatrix': this._viewMatrix,
-            'projViewMatrix': mat4.multiply(projViewMatrix, this._projMatrix, this._viewMatrix),
-            'shadow_lightProjViewModelMatrix': mat4.multiply(groundLightProjViewModelMatrix, matrix, ground.localTransform),
+            'projViewMatrix': projViewMatrix,
+            'shadow_lightProjViewModelMatrix': groundLightProjViewModelMatrix,
             'shadow_shadowMap': this._shadowMap,
             'esm_shadow_threshold': this._esmShadowThreshold,
             'shadow_opacity': opacity,
             'shadow_color': DEFAULT_SHADOW_COLOR,
             'color': color || DEFAULT_SHADOW_COLOR
-        }, this._groundScene, framebuffer);
+        });
+        uniforms.halton = halton || EMPTY_HALTON;
+        uniforms.projMatrix = this._projMatrix;
+        uniforms.viewMatrix = this._viewMatrix;
+        mat4.multiply(projViewMatrix, this._projMatrix, this._viewMatrix);
+        mat4.multiply(groundLightProjViewModelMatrix, matrix, ground.localTransform);
+        uniforms.shadow_shadowMap = this._shadowMap;
+        uniforms.shadow_opacity = opacity;
+        uniforms.color = color || DEFAULT_SHADOW_COLOR;
+        //display ground shadows
+        // 渲染地面阴影
+        this.renderer.render(this._shadowDisplayShader, uniforms, this._groundScene, framebuffer);
     }
 
     dispose() {
@@ -201,12 +213,15 @@ class ShadowProcess {
         if (!this._renderedShadows) {
             return true;
         }
+        const meshes = scene.getMeshes();
         const renderedView = this._renderedView;
-        if (scene.getMeshes().length !== renderedView.count || displayShadow !== renderedView.displayShadow) {
+        if (meshes.length !== renderedView.count || displayShadow !== renderedView.displayShadow) {
             return true;
         }
-        const meshes = scene.getMeshes();
-        const changed = false;
+        // 当没有 shadow mesh 且不需要 displayShadow 时，shadow map 不需要重算
+        if (meshes.length === 0 && !displayShadow) {
+            return false;
+        }
         for (let i = 0; i < meshes.length; i++) {
             const saved = this._renderedShadows[meshes[i].uuid];
             if (meshes[i].castShadow &&
@@ -217,7 +232,7 @@ class ShadowProcess {
             }
         }
 
-        return changed;
+        return false;
     }
 
     _createGround() {

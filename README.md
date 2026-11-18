@@ -25,6 +25,13 @@ If you are interested in what is going on, please refer to the previous [release
 * Rich 3D analysis functions
 * Traffic simulation animations
 
+## Performance Optimizations (perf_opt_vt)
+
+本分支（`perf_opt_vt`）针对核心渲染管线、矢量瓦片 Worker 数据处理、WebGL 场景管理、挖方分析跨平台差异修复与全局性能配置进行了系统性优化。
+完整优化说明（含坐标预转换批量化、Worker 字符串池 + 列式存储 + features:'id' 回传策略、GlobalConfig 配置项总览与调优预设、挖方分析 Mac/Win 差异与修复等）已单独整理为独立文档：
+
+- **[PERF_OPT_VT.md](./PERF_OPT_VT.md)** —— 详细优化说明 / Detailed Performance Tuning Guide
+
 ## Usage
 
 ### Install
